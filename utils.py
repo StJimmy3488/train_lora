@@ -111,21 +111,28 @@ def process_images_and_captions(images, concept_sentence=None):
 
 def create_dataset(images, captions):
     """Create temporary dataset from images and captions"""
-    destination_folder = f"tmp_datasets/{uuid.uuid4()}"
+    destination_folder = os.path.abspath(f"tmp_datasets/{uuid.uuid4()}")
     logger.info("Creating a dataset in folder: %s", destination_folder)
     os.makedirs(destination_folder, exist_ok=True)
 
     jsonl_file_path = os.path.join(destination_folder, "metadata.jsonl")
-    with open(jsonl_file_path, "a") as jsonl_file:
-        for image_path, caption in zip(images, captions):
-            # image_path is already resolved in run_training_job
-            logger.debug("Copying %s to dataset folder %s", image_path, destination_folder)
-            new_image_path = shutil.copy(image_path, destination_folder)
+    logger.debug("Creating metadata file at: %s", jsonl_file_path)
+    
+    with open(jsonl_file_path, "w") as jsonl_file:  # Changed from "a" to "w" to ensure clean file
+        for image_item, caption in zip(images, captions):
+            local_path = resolve_image_path(image_item)
+            logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
+
+            new_image_path = shutil.copy(local_path, destination_folder)
             file_name = os.path.basename(new_image_path)
             data = {"file_name": file_name, "prompt": caption}
             jsonl_file.write(json.dumps(data) + "\n")
             logger.debug("Wrote to metadata.jsonl: %s", data)
 
+    # Verify dataset creation
+    logger.debug("Dataset folder contents: %s", os.listdir(destination_folder))
+    logger.debug("metadata.jsonl exists: %s", os.path.exists(jsonl_file_path))
+    
     return destination_folder
 
 
@@ -212,34 +219,54 @@ async def train_model(
         with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
             config = yaml.safe_load(f)
 
+        # Get absolute path for dataset folder
+        dataset_folder = os.path.abspath(dataset_folder)
+        
         # Update configuration
         config["config"]["name"] = slugged_lora_name
         process_block = config["config"]["process"][0]
+        
+        # Configure dataset with absolute path and metadata file
+        process_block["datasets"] = [{
+            "folder_path": dataset_folder,
+            "metadata_file": "metadata.jsonl",  # Specify the metadata file name
+            "cache_to_disk": False,
+            "load_in_memory": True,
+            "shuffle": False,
+            "num_workers": 0,
+            "persistent_workers": False,
+            "prefetch_factor": None,
+            "pin_memory": False
+        }]
 
         # Configure for single-process operation
         process_block["train"].update({
-            "dataloader_workers": 0,  # Force single-process mode
-            "dataloader_timeout": 0,  # Disable timeout
-            "batch_size": 1,  # Single sample processing
+            "dataloader_workers": 0,
+            "dataloader_timeout": 0,
+            "batch_size": 1,
             "gradient_accumulation_steps": 1,
-            "mixed_precision": "no",  # Disable mixed precision
-            "seed": 42,  # Fixed seed for reproducibility
-            "use_deterministic_algorithms": True,  # Enable deterministic mode
-            "num_processes": 1,  # Force single process
-            "pin_memory": False,  # Disable pin_memory
-            "prefetch_factor": None  # Disable prefetching since we're using single process
+            "mixed_precision": "no",
+            "seed": 42,
+            "use_deterministic_algorithms": True,
+            "num_processes": 1,
+            "pin_memory": False,
+            "prefetch_factor": None
         })
-        
-        # Add dataset configuration
-        process_block["datasets"][0].update({
-            "cache_to_disk": False,  # Disable disk caching
-            "load_in_memory": True,   # Load dataset into memory
-            "shuffle": False,         # Disable shuffling to avoid multiprocessing
-            "num_workers": 0,         # Force single worker
-            "persistent_workers": False,  # Disable persistent workers
-            "prefetch_factor": None,  # Disable prefetching
-            "pin_memory": False       # Disable pin memory
-        })
+
+        # Add environment configuration
+        process_block["environment"] = {
+            "multiprocessing_context": "spawn",
+            "torch_compile": False,
+            "torch_inference_mode": False,
+            "cudnn_benchmark": False,
+            "deterministic_algorithms": True,
+            "cuda_launch_blocking": "1"
+        }
+
+        # Log the dataset configuration for debugging
+        logger.debug("Dataset configuration: %s", process_block["datasets"][0])
+        logger.debug("Dataset folder exists: %s", os.path.exists(dataset_folder))
+        logger.debug("Dataset folder contents: %s", os.listdir(dataset_folder))
         
         process_block.update({
             "model": {
@@ -261,16 +288,6 @@ async def train_model(
                 "push_to_hub": False
             }
         })
-
-        # Add environment configuration
-        process_block["environment"] = {
-            "multiprocessing_context": "spawn",
-            "torch_compile": False,  # Disable torch compilation
-            "torch_inference_mode": False,  # Disable inference mode
-            "cudnn_benchmark": False,  # Disable cuDNN benchmark
-            "deterministic_algorithms": True,  # Enable deterministic algorithms
-            "cuda_launch_blocking": "1"  # Force CUDA operations to be synchronous
-        }
 
         if concept_sentence:
             logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
