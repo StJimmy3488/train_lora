@@ -215,15 +215,17 @@ async def train_model(
         # Update configuration
         config["config"]["name"] = slugged_lora_name
         process_block = config["config"]["process"][0]
-        
-        # Add DataLoader configuration
-        process_block["dataset"] = {
-            "batch_size": 1,  # Set to 1 to avoid collation issues
-            "num_workers": 0,  # Disable multiprocessing in DataLoader
-            "pin_memory": False,
-            "shuffle": True,
-            "persistent_workers": False
-        }
+
+        # Configure for single-process operation
+        process_block["train"].update({
+            "dataloader_workers": 0,  # Force single-process mode
+            "dataloader_timeout": 0,  # Disable timeout
+            "batch_size": 1,  # Single sample processing
+            "gradient_accumulation_steps": 1,
+            "mixed_precision": "no",  # Disable mixed precision to avoid complexity
+            "seed": 42,  # Fixed seed for reproducibility
+            "use_deterministic_algorithms": True  # Enable deterministic mode
+        })
         
         process_block.update({
             "model": {
@@ -240,12 +242,25 @@ async def train_model(
                 "linear": int(rank),
                 "linear_alpha": int(rank)
             },
-            "datasets": [{"folder_path": dataset_folder}],
+            "datasets": [{
+                "folder_path": dataset_folder,
+                "cache_to_disk": False,  # Disable disk caching
+                "load_in_memory": True   # Load dataset into memory
+            }],
             "save": {
                 "output_dir": f"tmp_models/{slugged_lora_name}",
                 "push_to_hub": False
             }
         })
+
+        # Add environment configuration
+        process_block["environment"] = {
+            "multiprocessing_context": "spawn",
+            "torch_compile": False,  # Disable torch compilation
+            "torch_inference_mode": False,  # Disable inference mode
+            "cudnn_benchmark": False,  # Disable cuDNN benchmark
+            "deterministic_algorithms": True  # Enable deterministic algorithms
+        }
 
         if concept_sentence:
             logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
@@ -268,13 +283,15 @@ async def train_model(
             if isinstance(advanced_options, str):
                 advanced_options_dict = yaml.safe_load(advanced_options)
                 # Preserve critical settings
-                dataset_config = process_block.get("dataset", {})
+                train_config = process_block["train"].copy()
+                env_config = process_block.get("environment", {}).copy()
                 config["config"]["process"][0] = await recursive_update(
                     config["config"]["process"][0],
                     advanced_options_dict
                 )
-                # Restore dataset settings
-                process_block["dataset"] = dataset_config
+                # Restore critical settings
+                process_block["train"].update(train_config)
+                process_block["environment"] = env_config
 
         # Save config
         os.makedirs("tmp_configs", exist_ok=True)
@@ -290,6 +307,11 @@ async def train_model(
 
         if job is None:
             raise RuntimeError(f"get_job() returned None for config path: {config_path}")
+
+        # Set environment variables before running the job
+        os.environ["PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION"] = "1"
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["PYTHONWARNINGS"] = "ignore"
 
         logger.info("Running job...")
         job.run()
