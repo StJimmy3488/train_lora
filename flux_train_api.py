@@ -301,6 +301,12 @@ async def run_training_job(job_id: str, request: TrainingRequest):
         os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
         os.environ['OMP_NUM_THREADS'] = '1'
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
+        
+        # Force single-threaded operation
+        torch.set_num_threads(1)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
         
         # Update job status - downloading images
         with get_db() as conn:
