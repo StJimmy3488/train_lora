@@ -17,6 +17,10 @@ import asyncio
 from contextlib import nullcontext
 from io import BufferedWriter
 from s3_utils import get_s3_client
+import psutil
+import boto3
+import multiprocessing
+from huggingface_hub import whoami
 
 logger = logging.getLogger(__name__)
 
@@ -251,191 +255,82 @@ async def train_model(
     sample_prompts=None,
     advanced_options=None
 ):
-    """Train the model and store exclusively in S3, returning a folder URL."""
-    config_path = None
-    s3_folder_url = None
-    local_model_dir = None
-
+    """Train the model with the given parameters"""
+    push_to_hub = True
     try:
-        slugged_lora_name = slugify(lora_name)
-        logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
+        auth_info = whoami()
+        if not (auth_info["auth"]["accessToken"]["role"] == "write" or 
+                "repo.write" in auth_info["auth"]["accessToken"]["fineGrained"]["scoped"][0]["permissions"]):
+            push_to_hub = False
+    except:
+        push_to_hub = False
 
-        # Load default config
-        logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
-        with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
-            config = yaml.safe_load(f)
+    slugged_lora_name = slugify(lora_name)
+    
+    # Load default config
+    with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
+        config = yaml.safe_load(f)
 
-        # Get absolute path for dataset folder
-        dataset_folder = os.path.abspath(dataset_folder)
-        
-        # Update configuration
-        config["config"]["name"] = slugged_lora_name
-        process_block = config["config"]["process"][0]
-        
-        # Configure dataset with absolute path and metadata file
-        process_block["datasets"] = [{
-            "folder_path": dataset_folder,
-            "metadata_file": "metadata.jsonl",  # Specify the metadata file name
-            "cache_to_disk": False,
-            "load_in_memory": True,
-            "shuffle": False,
-            "num_workers": 0,
-            "persistent_workers": False,
-            "prefetch_factor": None,
-            "pin_memory": False
-        }]
+    # Update configuration
+    config["config"]["name"] = slugged_lora_name
+    config["config"]["process"][0].update({
+        "model": {
+            "low_vram": low_vram,
+            "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
+            "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None
+        },
+        "train": {
+            "skip_first_sample": True,
+            "steps": int(steps),
+            "lr": float(lr)
+        },
+        "network": {
+            "linear": int(rank),
+            "linear_alpha": int(rank)
+        },
+        "datasets": [{"folder_path": dataset_folder}],
+        "save": {"push_to_hub": push_to_hub}
+    })
 
-        # Configure for single-process operation
-        process_block["train"].update({
-            "dataloader_workers": 5,
-            "dataloader_timeout": 0,
-            "batch_size": 1,
-            "gradient_accumulation_steps": 1,
-            "mixed_precision": "no",
-            "seed": 42,
-            "use_deterministic_algorithms": True,
-            "num_processes": 1,
-            "pin_memory": False,
-            "prefetch_factor": None
+    if push_to_hub:
+        username = whoami()["name"]
+        config["config"]["process"][0]["save"].update({
+            "hf_repo_id": f"{username}/{slugged_lora_name}",
+            "hf_private": True
         })
 
-        # Add environment configuration
-        process_block["environment"] = {
-            "multiprocessing_context": "fork",
-            "torch_compile": False,
-            "torch_inference_mode": False,
-            "cudnn_benchmark": True,
-            "deterministic_algorithms": True,
-            "cuda_launch_blocking": "0"
-        }
+    if concept_sentence:
+        config["config"]["process"][0]["trigger_word"] = concept_sentence
 
-        # Log the dataset configuration for debugging
-        logger.debug("Dataset configuration: %s", process_block["datasets"][0])
-        logger.debug("Dataset folder exists: %s", os.path.exists(dataset_folder))
-        logger.debug("Dataset folder contents: %s", os.listdir(dataset_folder))
-        
-        process_block.update({
-            "model": {
-                "low_vram": low_vram,
-                "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
-                "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None
-            },
-            "train": {
-                "skip_first_sample": True,
-                "steps": int(steps),
-                "lr": float(lr)
-            },
-            "network": {
-                "linear": int(rank),
-                "linear_alpha": int(rank)
-            },
-            "save": {
-                "output_dir": f"tmp_models/{slugged_lora_name}",
-                "push_to_hub": False
-            }
+    if sample_prompts:
+        config["config"]["process"][0]["train"]["disable_sampling"] = False
+        config["config"]["process"][0]["sample"].update({
+            "sample_every": steps,
+            "sample_steps": 28 if model_type == "dev" else 4,
+            "prompts": sample_prompts
         })
+    else:
+        config["config"]["process"][0]["train"]["disable_sampling"] = True
 
-        if concept_sentence:
-            logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
-            process_block["trigger_word"] = concept_sentence
+    if advanced_options:
+        config["config"]["process"][0] = await recursive_update(
+            config["config"]["process"][0], 
+            yaml.safe_load(advanced_options)
+        )
 
-        if sample_prompts:
-            logger.debug("Sample prompts provided. Will enable sampling.")
-            process_block["train"]["disable_sampling"] = False
-            process_block["sample"].update({
-                "sample_every": steps,
-                "sample_steps": 28 if model_type == "dev" else 4,
-                "prompts": sample_prompts.split(",") if isinstance(sample_prompts, str) else sample_prompts
-            })
-        else:
-            logger.debug("No sample prompts provided. Disabling sampling.")
-            process_block["train"]["disable_sampling"] = True
+    # Save config
+    config_path = f"tmp/{uuid.uuid4()}-{slugged_lora_name}.yaml"
+    os.makedirs("tmp", exist_ok=True)
+    with open(config_path, "w") as f:
+        yaml.dump(config, f)
 
-        if advanced_options:
-            logger.debug("Merging advanced_options YAML into config.")
-            if isinstance(advanced_options, str):
-                advanced_options_dict = yaml.safe_load(advanced_options)
-                # Preserve critical settings
-                train_config = process_block["train"].copy()
-                env_config = process_block.get("environment", {}).copy()
-                config["config"]["process"][0] = await recursive_update(
-                    config["config"]["process"][0],
-                    advanced_options_dict
-                )
-                # Restore critical settings
-                process_block["train"].update(train_config)
-                process_block["environment"] = env_config
+    # Run training
+    job = get_job(config_path)
+    job.run()
+    job.cleanup()
 
-        # Save config
-        os.makedirs("tmp_configs", exist_ok=True)
-        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
-        logger.debug("Saving updated config to: %s", config_path)
-        with open(config_path, "w") as f:
-            yaml.dump(config, f)
-
-        # Run training
-        logger.info("Retrieving job with config path: %s", config_path)
-        job = get_job(config_path, slugged_lora_name)
-        logger.debug("job object => %s", job)
-
-        if job is None:
-            raise RuntimeError(f"get_job() returned None for config path: {config_path}")
-
-        # Set environment variables before running the job
-        os.environ["PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION"] = "1"
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["PYTHONWARNINGS"] = "ignore"
-
-        logger.info("Running job...")
-        job.run()
-        logger.info("Job completed, cleaning up...")
-        job.cleanup()
-
-        # Upload to S3
-        local_model_dir = f"output/{slugged_lora_name}"
-        bucket_name = os.environ.get("S3_BUCKET")
-        s3_domain = os.getenv("S3_DOMAIN", "https://r2.syntx.ai")
-
-        if bucket_name and os.path.exists(local_model_dir):
-            s3_prefix = f"loras/flux/{slugged_lora_name}"
-            logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
-            
-            if await upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
-                s3_folder_url = f"{s3_domain}/{s3_prefix}/"
-                logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            else:
-                raise RuntimeError("Failed to upload model to S3")
-        else:
-            raise RuntimeError("S3 bucket not configured or model directory missing")
-
-        return s3_folder_url
-
-    except Exception as e:
-        logger.error("Error in train_model: %s", str(e))
-        raise
-
-    finally:
-        # Always clean up temporary files
-        try:
-            # Clean up dataset folder
-            if dataset_folder and os.path.exists(dataset_folder):
-                logger.debug("Removing dataset folder: %s", dataset_folder)
-                shutil.rmtree(dataset_folder, ignore_errors=True)
-            
-            # Clean up config file
-            if config_path and os.path.exists(config_path):
-                logger.debug("Removing config file: %s", config_path)
-                os.remove(config_path)
-            
-            # Clean up local model directory if upload failed
-            if local_model_dir and os.path.exists(local_model_dir) and not s3_folder_url:
-                logger.debug("Removing local model directory: %s", local_model_dir)
-                shutil.rmtree(local_model_dir, ignore_errors=True)
-            
-            # Clean up any tmp_downloads directory
-            if os.path.exists("tmp_downloads"):
-                logger.debug("Removing tmp_downloads directory")
-                shutil.rmtree("tmp_downloads", ignore_errors=True)
-                
-        except Exception as cleanup_error:
-            logger.error("Error during cleanup: %s", str(cleanup_error))
+    # Return the model path/identifier
+    if push_to_hub:
+        return f"{username}/{slugged_lora_name}"
+    else:
+        return f"local_models/{slugged_lora_name}"
