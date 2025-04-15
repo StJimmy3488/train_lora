@@ -226,7 +226,19 @@ async def train_model(
             "seed": 42,  # Fixed seed for reproducibility
             "use_deterministic_algorithms": True,  # Enable deterministic mode
             "num_processes": 1,  # Force single process
-            "pin_memory": False  # Disable pin_memory
+            "pin_memory": False,  # Disable pin_memory
+            "prefetch_factor": None  # Disable prefetching since we're using single process
+        })
+        
+        # Add dataset configuration
+        process_block["datasets"][0].update({
+            "cache_to_disk": False,  # Disable disk caching
+            "load_in_memory": True,   # Load dataset into memory
+            "shuffle": False,         # Disable shuffling to avoid multiprocessing
+            "num_workers": 0,         # Force single worker
+            "persistent_workers": False,  # Disable persistent workers
+            "prefetch_factor": None,  # Disable prefetching
+            "pin_memory": False       # Disable pin memory
         })
         
         process_block.update({
@@ -244,14 +256,6 @@ async def train_model(
                 "linear": int(rank),
                 "linear_alpha": int(rank)
             },
-            "datasets": [{
-                "folder_path": dataset_folder,
-                "cache_to_disk": False,  # Disable disk caching
-                "load_in_memory": True,   # Load dataset into memory
-                "shuffle": False,         # Disable shuffling to avoid multiprocessing
-                "num_workers": 0,         # Force single worker
-                "persistent_workers": False  # Disable persistent workers
-            }],
             "save": {
                 "output_dir": f"tmp_models/{slugged_lora_name}",
                 "push_to_hub": False
