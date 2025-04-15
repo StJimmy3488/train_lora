@@ -297,14 +297,11 @@ async def kill_job(job_id: str):
 async def run_training_job(job_id: str, request: TrainingRequest):
     """Run the training job in the background"""
     try:
-<<<<<<< HEAD
         # Set environment variables for single process operation
         os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
         os.environ['OMP_NUM_THREADS'] = '1'
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
         
-=======
->>>>>>> b4999e08067af5c7f68a630557f95374d09978bc
         # Update job status - downloading images
         with get_db() as conn:
             conn.execute(

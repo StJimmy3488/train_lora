@@ -18,17 +18,10 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 
-<<<<<<< HEAD
 # print(f"CUDA available: {torch.cuda.is_available()}")
 # print(f"CUDA version: {torch.version.cuda}")
 # print(f"GPU device: {torch.cuda.get_device_name(0)}")
 # print(f"GPU compute capability: {torch.cuda.get_device_capability(0)}")
-=======
-print(f"CUDA available: {torch.cuda.is_available()}")
-print(f"CUDA version: {torch.version.cuda}")
-print(f"GPU device: {torch.cuda.get_device_name(0)}")
-print(f"GPU compute capability: {torch.cuda.get_device_capability(0)}")
->>>>>>> b4999e08067af5c7f68a630557f95374d09978bc
 
 
 def process_images_and_captions(images, concept_sentence=None):
@@ -229,16 +222,10 @@ async def train_model(
             "dataloader_timeout": 0,  # Disable timeout
             "batch_size": 1,  # Single sample processing
             "gradient_accumulation_steps": 1,
-<<<<<<< HEAD
             "mixed_precision": "no",  # Disable mixed precision
             "seed": 42,  # Fixed seed for reproducibility
             "use_deterministic_algorithms": True,  # Enable deterministic mode
             "num_processes": 1  # Add this line to force single process
-=======
-            "mixed_precision": "no",  # Disable mixed precision to avoid complexity
-            "seed": 42,  # Fixed seed for reproducibility
-            "use_deterministic_algorithms": True  # Enable deterministic mode
->>>>>>> b4999e08067af5c7f68a630557f95374d09978bc
         })
         
         process_block.update({
@@ -273,12 +260,8 @@ async def train_model(
             "torch_compile": False,  # Disable torch compilation
             "torch_inference_mode": False,  # Disable inference mode
             "cudnn_benchmark": False,  # Disable cuDNN benchmark
-<<<<<<< HEAD
             "deterministic_algorithms": True,  # Enable deterministic algorithms
             "cuda_launch_blocking": "1"  # Add this line
-=======
-            "deterministic_algorithms": True  # Enable deterministic algorithms
->>>>>>> b4999e08067af5c7f68a630557f95374d09978bc
         }
 
         if concept_sentence:
