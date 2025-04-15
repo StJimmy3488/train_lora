@@ -102,7 +102,7 @@ def process_images_and_captions(images, concept_sentence=None):
 
                 generated_texts = processor.batch_decode(
                     generated_ids,
-                    skip_special_tokens=False
+                    skip_special_tokens=True
                 )
 
             # Process generated texts
