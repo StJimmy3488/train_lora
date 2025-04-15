@@ -15,7 +15,8 @@ from slugify import slugify
 from toolkit.job import get_job
 import asyncio
 from contextlib import nullcontext
-
+from io import BufferedWriter
+from s3_utils import get_s3_client
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,11 @@ def process_images_and_captions(images, concept_sentence=None):
     
     logger.info(f"Using device: {device} with dtype: {torch_dtype}")
 
+    # Add memory tracking
+    if torch.cuda.is_available():
+        initial_memory = torch.cuda.memory_allocated()
+        logger.debug(f"Initial GPU memory: {initial_memory / 1024**2:.2f}MB")
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             "multimodalart/Florence-2-large-no-flash-attn",
@@ -59,21 +65,25 @@ def process_images_and_captions(images, concept_sentence=None):
             trust_remote_code=True
         )
 
-        # Process images in batches
-        batch_size = 4  # Adjust based on your GPU memory
-        captions = []
+        # Increase batch size if GPU memory allows
+        batch_size = 8  # Increased from 4
         
-        for i in range(0, len(images), batch_size):
-            batch_images = images[i:i + batch_size]
-            batch_pil_images = []
+        # Pre-load all images before processing
+        all_pil_images = []
+        for image_path in images:
+            if isinstance(image_path, str):
+                # Add basic image validation/optimization
+                image = Image.open(image_path).convert("RGB")
+                # Resize large images to reasonable dimensions
+                if max(image.size) > 2048:
+                    image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+                all_pil_images.append(image)
+        
+        # Process in larger batches
+        captions = []
+        for i in range(0, len(all_pil_images), batch_size):
+            batch_pil_images = all_pil_images[i:i + batch_size]
             
-            # Prepare batch of images
-            for image_path in batch_images:
-                if isinstance(image_path, str):
-                    image = Image.open(image_path).convert("RGB")
-                    image.load()
-                    batch_pil_images.append(image)
-
             # Process batch
             prompt = "<DETAILED_CAPTION>"
             inputs = processor(
@@ -111,9 +121,11 @@ def process_images_and_captions(images, concept_sentence=None):
                 captions.append(caption)
                 logger.debug("Final caption for image %d: %s", i + idx, caption)
 
-            # Clear GPU memory after each batch
-            if device == "cuda":
-                torch.cuda.empty_cache()
+            # Clear memory more aggressively
+            for pil_image in batch_pil_images:
+                pil_image.close()
+            del inputs
+            torch.cuda.empty_cache()
 
     finally:
         # Cleanup
@@ -124,6 +136,10 @@ def process_images_and_captions(images, concept_sentence=None):
             del processor
         if device == "cuda":
             torch.cuda.empty_cache()
+
+        if torch.cuda.is_available():
+            final_memory = torch.cuda.memory_allocated()
+            logger.debug(f"Final GPU memory: {final_memory / 1024**2:.2f}MB")
 
     logger.info("Generated %d captions.", len(captions))
     return captions
@@ -137,17 +153,27 @@ async def create_dataset(images, captions):
     jsonl_file_path = os.path.join(destination_folder, "metadata.jsonl")
     logger.debug("Creating metadata file at: %s", jsonl_file_path)
     
+    # Use buffered writes for better I/O performance
     with open(jsonl_file_path, "w") as jsonl_file:
-        for image_item, caption in zip(images, captions):
-            # Await the resolve_image_path call
-            local_path = await resolve_image_path(image_item)
-            logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
+        # Process files in chunks
+        chunk_size = 50
+        for i in range(0, len(images), chunk_size):
+            chunk_images = images[i:i + chunk_size]
+            chunk_captions = captions[i:i + chunk_size]
+            
+            # Process chunks in parallel
+            tasks = [resolve_image_path(img) for img in chunk_images]
+            local_paths = await asyncio.gather(*tasks)
+            
+            for image_item, local_path in zip(chunk_images, local_paths):
+                # Await the resolve_image_path call
+                logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
 
-            new_image_path = shutil.copy(local_path, destination_folder)
-            file_name = os.path.basename(new_image_path)
-            data = {"file_name": file_name, "prompt": caption}
-            jsonl_file.write(json.dumps(data) + "\n")
-            logger.debug("Wrote to metadata.jsonl: %s", data)
+                new_image_path = shutil.copy(local_path, destination_folder)
+                file_name = os.path.basename(new_image_path)
+                data = {"file_name": file_name, "prompt": chunk_captions[i - len(images) + i]}
+                jsonl_file.write(json.dumps(data) + "\n")
+                logger.debug("Wrote to metadata.jsonl: %s", data)
 
     # Verify dataset creation
     logger.debug("Dataset folder contents: %s", os.listdir(destination_folder))

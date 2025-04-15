@@ -15,6 +15,7 @@ import os
 import multiprocessing
 import torch
 import psutil
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -161,6 +162,16 @@ def run_training_process(job_id: str, request_data: dict):
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
     """Start a new training job"""
+    # Add request validation caching
+    @lru_cache(maxsize=100)
+    def validate_image_url(url: str) -> bool:
+        return url.startswith(('http://', 'https://'))
+    
+    # Validate all URLs in parallel
+    validation_tasks = [validate_image_url(url) for url in request.images]
+    if not all(validation_tasks):
+        raise HTTPException(status_code=400, detail="Invalid image URLs")
+
     # Check if there's already a running job
     with get_db() as conn:
         running_job = conn.execute(
