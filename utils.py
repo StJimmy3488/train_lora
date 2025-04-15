@@ -302,11 +302,11 @@ async def train_model(
         # Add environment configuration
         process_block["environment"] = {
             "multiprocessing_context": "spawn",
-            "torch_compile": False,
+            "torch_compile": True,
             "torch_inference_mode": False,
-            "cudnn_benchmark": False,
+            "cudnn_benchmark": True,
             "deterministic_algorithms": True,
-            "cuda_launch_blocking": "1"
+            "cuda_launch_blocking": "0"
         }
 
         # Log the dataset configuration for debugging
