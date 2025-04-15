@@ -303,7 +303,7 @@ async def train_model(
 
     if advanced_options:
         logger.debug("Merging advanced_options YAML into config.")
-        config["config"]["process"][0] = recursive_update(
+        config["config"]["process"][0] = await recursive_update(
             config["config"]["process"][0],
             yaml.safe_load(advanced_options)
         )
