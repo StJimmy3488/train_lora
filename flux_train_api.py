@@ -341,8 +341,8 @@ async def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
 
-        # Create dataset
-        dataset_folder = create_dataset(images, captions)
+        # Create dataset - now with await
+        dataset_folder = await create_dataset(images, captions)
 
         # Update status - training
         with get_db() as conn:

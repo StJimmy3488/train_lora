@@ -109,7 +109,7 @@ def process_images_and_captions(images, concept_sentence=None):
     logger.info("Generated %d captions.", len(captions))
     return captions
 
-def create_dataset(images, captions):
+async def create_dataset(images, captions):
     """Create temporary dataset from images and captions"""
     destination_folder = os.path.abspath(f"tmp_datasets/{uuid.uuid4()}")
     logger.info("Creating a dataset in folder: %s", destination_folder)
@@ -118,9 +118,10 @@ def create_dataset(images, captions):
     jsonl_file_path = os.path.join(destination_folder, "metadata.jsonl")
     logger.debug("Creating metadata file at: %s", jsonl_file_path)
     
-    with open(jsonl_file_path, "w") as jsonl_file:  # Changed from "a" to "w" to ensure clean file
+    with open(jsonl_file_path, "w") as jsonl_file:
         for image_item, caption in zip(images, captions):
-            local_path = resolve_image_path(image_item)
+            # Await the resolve_image_path call
+            local_path = await resolve_image_path(image_item)
             logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
 
             new_image_path = shutil.copy(local_path, destination_folder)
