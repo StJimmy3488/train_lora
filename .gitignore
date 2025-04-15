@@ -179,4 +179,4 @@ cython_debug/
 .vscode/settings.json
 .DS_Store
 ._.DS_Store
-aitk_db.db
+aitk_db.dbjobs.db
