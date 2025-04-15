@@ -1,0 +1,6 @@
+{
+    "require": {
+        "guzzlehttp/guzzle": "^7.9",
+        "sergix44/gradio-client-php": "^0.1.3"
+    }
+}

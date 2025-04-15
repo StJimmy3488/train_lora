@@ -1,0 +1,40 @@
+device: cuda:0
+model:
+  is_flux: true
+  quantize: true
+  name_or_path: /app/ai-toolkit/FLUX.1-dev
+network:
+  linear: 16 #it will overcome the 'rank' parameter
+  linear_alpha: 16 #you can have an alpha different than the ranking if you'd like
+  type: lora
+  network_kwargs:
+    only_if_contains:
+      - "transformer.single_transformer_blocks.10."
+      - "transformer.single_transformer_blocks.25."
+sample:
+      sampler: flowmatch
+      sample_every: 1000
+      width: 1024
+      height: 1024
+      prompts:
+      - person in bustling cafe
+save:
+  dtype: float16
+  hf_private: true
+  max_step_saves_to_keep: 4
+  save_every: 10000
+train:
+  steps: 10
+  batch_size: 1
+  dtype: bf16
+  ema_config:
+    ema_decay: 0.99
+    use_ema: true
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  lr: 1e-3
+  skip_first_sample: true
+  noise_scheduler: flowmatch 
+  optimizer: adamw8bit #options: prodigy, dadaptation, adamw, adamw8bit, lion, lion8bit
+  train_text_encoder: false #probably doesn't work for flux
+  train_unet: true
