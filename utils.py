@@ -215,6 +215,16 @@ async def train_model(
         # Update configuration
         config["config"]["name"] = slugged_lora_name
         process_block = config["config"]["process"][0]
+        
+        # Add DataLoader configuration
+        process_block["dataset"] = {
+            "batch_size": 1,  # Set to 1 to avoid collation issues
+            "num_workers": 0,  # Disable multiprocessing in DataLoader
+            "pin_memory": False,
+            "shuffle": True,
+            "persistent_workers": False
+        }
+        
         process_block.update({
             "model": {
                 "low_vram": low_vram,
@@ -257,10 +267,14 @@ async def train_model(
             logger.debug("Merging advanced_options YAML into config.")
             if isinstance(advanced_options, str):
                 advanced_options_dict = yaml.safe_load(advanced_options)
+                # Preserve critical settings
+                dataset_config = process_block.get("dataset", {})
                 config["config"]["process"][0] = await recursive_update(
                     config["config"]["process"][0],
                     advanced_options_dict
                 )
+                # Restore dataset settings
+                process_block["dataset"] = dataset_config
 
         # Save config
         os.makedirs("tmp_configs", exist_ok=True)
