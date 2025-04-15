@@ -14,6 +14,7 @@ import yaml
 from slugify import slugify
 from toolkit.job import get_job
 import asyncio
+from contextlib import nullcontext
 
 
 logger = logging.getLogger(__name__)
@@ -39,9 +40,9 @@ def process_images_and_captions(images, concept_sentence=None):
             detail="Maximum 150 images allowed"
         )
 
-    # Force CPU execution
-    device = "cpu"
-    torch_dtype = torch.float32
+    # Use CUDA if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_dtype = torch.float16 if device == "cuda" else torch.float32
     
     logger.info(f"Using device: {device} with dtype: {torch_dtype}")
 
@@ -50,61 +51,79 @@ def process_images_and_captions(images, concept_sentence=None):
             "multimodalart/Florence-2-large-no-flash-attn",
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-            device_map="cpu"  # Force CPU
-        )
+            device_map=device
+        ).to(device)
 
         processor = AutoProcessor.from_pretrained(
             "multimodalart/Florence-2-large-no-flash-attn",
             trust_remote_code=True
         )
 
+        # Process images in batches
+        batch_size = 4  # Adjust based on your GPU memory
         captions = []
-        for image_path in images:
-            logger.debug("Processing image: %s", image_path)
-            if isinstance(image_path, str):
-                image = Image.open(image_path).convert("RGB")
-                image.load()
+        
+        for i in range(0, len(images), batch_size):
+            batch_images = images[i:i + batch_size]
+            batch_pil_images = []
+            
+            # Prepare batch of images
+            for image_path in batch_images:
+                if isinstance(image_path, str):
+                    image = Image.open(image_path).convert("RGB")
+                    image.load()
+                    batch_pil_images.append(image)
 
+            # Process batch
             prompt = "<DETAILED_CAPTION>"
             inputs = processor(
-                text=prompt,
-                images=image,
+                text=[prompt] * len(batch_pil_images),
+                images=batch_pil_images,
                 return_tensors="pt"
             ).to(device, torch_dtype)
 
-            generated_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=3
-            )
+            with torch.amp.autocast('cuda') if device == "cuda" else nullcontext():
+                generated_ids = model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=1024,
+                    num_beams=3
+                )
 
-            generated_text = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=False
-            )[0]
+                generated_texts = processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=False
+                )
 
-            parsed_answer = processor.post_process_generation(
-                generated_text,
-                task=prompt,
-                image_size=(image.width, image.height)
-            )
+            # Process generated texts
+            for idx, (generated_text, pil_image) in enumerate(zip(generated_texts, batch_pil_images)):
+                parsed_answer = processor.post_process_generation(
+                    generated_text,
+                    task=prompt,
+                    image_size=(pil_image.width, pil_image.height)
+                )
 
-            caption = parsed_answer["<DETAILED_CAPTION>"].replace(
-                "The image shows ", ""
-            )
-            if concept_sentence:
-                caption = f"{caption} [trigger]"
-            captions.append(caption)
-            logger.debug("Final caption for image: %s", caption)
+                caption = parsed_answer["<DETAILED_CAPTION>"].replace(
+                    "The image shows ", ""
+                )
+                if concept_sentence:
+                    caption = f"{caption} [trigger]"
+                captions.append(caption)
+                logger.debug("Final caption for image %d: %s", i + idx, caption)
+
+            # Clear GPU memory after each batch
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
     finally:
         # Cleanup
         if 'model' in locals():
+            model.to("cpu")
             del model
         if 'processor' in locals():
             del processor
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     logger.info("Generated %d captions.", len(captions))
     return captions
