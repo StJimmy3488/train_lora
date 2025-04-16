@@ -20,7 +20,7 @@ import torch
 import boto3
 from botocore.exceptions import NoCredentialsError
 from slugify import slugify
-import aiohttp
+
 from transformers import AutoProcessor, AutoModelForCausalLM
 from botocore.config import Config
 
@@ -124,17 +124,18 @@ async def resolve_image_path(image_item):
             local_name = os.path.join("tmp_downloads", f"{uuid.uuid4()}.png")
             
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(image_item) as response:
-                        response.raise_for_status()
-                        with open(local_name, "wb") as f:
-                            f.write(await response.read())
+                response = requests.get(image_item, stream=True)
+                response.raise_for_status()
+                with open(local_name, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
                 return local_name
             except Exception as ex:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Failed to download image from URL {image_item}: {str(ex)}"
                 )
+
 
         # Handle local paths
         if os.path.exists(image_item):
