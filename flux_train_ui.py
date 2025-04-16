@@ -12,15 +12,17 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from enum import Enum
 import sqlite3
 from contextlib import contextmanager, asynccontextmanager
-import psutil
+
 from PIL import Image
 from dotenv import load_dotenv
 import requests  
 import torch
+import boto3
+from botocore.exceptions import NoCredentialsError
 from slugify import slugify
-from s3_utils import upload_directory_to_s3
 
 from transformers import AutoProcessor, AutoModelForCausalLM
+from botocore.config import Config
 
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "ai-toolkit")
@@ -34,6 +36,63 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
+
+import boto3
+from botocore.config import Config
+import os
+import psutil
+import asyncio
+import multiprocessing
+
+def get_s3_client():
+    """Create S3-compatible client for Cloudflare R2"""
+    s3_endpoint = os.getenv("S3_ENDPOINT")
+    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    region_name = os.getenv("AWS_REGION")
+
+    if not s3_endpoint or not aws_access_key_id or not aws_secret_access_key:
+        raise RuntimeError("Missing S3 credentials. Check .env file.")
+
+    config = Config(
+        signature_version="s3v4",  # ✅ Explicitly enforce Signature v4
+        retries={"max_attempts": 3, "mode": "standard"}
+    )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=s3_endpoint,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=region_name,
+        config=config
+    )
+
+
+def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
+    """Uploads a directory to S3 while maintaining folder structure"""
+    logger.info("Uploading directory '%s' to S3 bucket '%s' with prefix '%s'.",
+                local_dir, bucket_name, s3_prefix)
+    try:
+        s3 = get_s3_client()
+        for root, _, files in os.walk(local_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                relative_path = os.path.relpath(local_path, local_dir)
+                s3_key = f"{s3_prefix}/{relative_path}"
+                logger.debug("Uploading file '%s' to '%s'.", local_path, s3_key)
+                s3.upload_file(local_path, bucket_name, s3_key)
+        return True
+    except NoCredentialsError:
+        logger.error("AWS credentials not available.")
+        return False
+    except Exception as e:
+        logger.exception("Error uploading to S3: %s", e)
+        return False
+    finally:
+        # Clean up local directory regardless of upload success
+        logger.debug("Removing local directory '%s'.", local_dir)
+        shutil.rmtree(local_dir, ignore_errors=True)
 
 
 async def resolve_image_path(image_item):
@@ -134,26 +193,26 @@ def process_images_and_captions(images, concept_sentence=None):
             ).to(device, torch_dtype)
 
             generated_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=3
-            )
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=1024,
+                    num_beams=3
+                )
 
             generated_text = processor.batch_decode(
                 generated_ids,
                 skip_special_tokens=False
             )[0]
 
-            parsed_answer = processor.post_process_generation(
+        parsed_answer = processor.post_process_generation(
                 generated_text,
                 task=prompt,
                 image_size=(image.width, image.height)
-            )
+        )
 
-            caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-            if concept_sentence:
-                caption = f"{caption} [trigger]"
+        caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
+        if concept_sentence:
+            caption = f"{caption} [trigger]"
 
             captions.append(caption)
             logger.debug("Caption generated: %s", caption)
@@ -164,9 +223,9 @@ def process_images_and_captions(images, concept_sentence=None):
             if os.path.exists(path):
                 os.remove(path)
 
-        model.to("cpu")
-        del model
-        del processor
+    model.to("cpu")
+    del model
+    del processor
 
     return captions
 
@@ -370,13 +429,13 @@ async def train_lora(
         logger.info("3. Train the model using train_model function.")
         folder_url = await train_model(
             dataset_folder,
-            lora_name,
-            concept_sentence,
-            steps,
-            lr,
-            rank,
+    lora_name,
+    concept_sentence,
+    steps,
+    lr,
+    rank,
             model_type,
-            low_vram,
+    low_vram,
             sample_prompts,
             advanced_options
         )
@@ -423,44 +482,33 @@ class TrainingResponse(BaseModel):
     message: str
 
 class JobStatus(BaseModel):
+    job_id: Optional[str] = None
     status: str
     progress: float
     folder_url: Optional[str] = None
     error: Optional[str] = None
 
-async def run_training_job(job_id: str, request: TrainingRequest):
-    """Background task to run the training job"""
+def run_training_process(job_id: str, request_dict: dict):
+    """The actual training process that runs in a separate process"""
     try:
-        # Update job status to processing
+        # Reconstruct request object from dict
+        request = TrainingRequest(**request_dict)
+        
+        # Create a new event loop for this process
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Update job status to processing and store PID
         with get_db() as conn:
             conn.execute(
-                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
-                ("processing", 0.1, job_id)
+                "UPDATE jobs SET status = ?, progress = ?, pid = ? WHERE job_id = ?",
+                ("processing", 0.1, os.getpid(), job_id)
             )
             conn.commit()
 
-        # Process images and generate captions
-        captions = process_images_and_captions(request.images, request.concept_sentence)
-
-        # Create dataset
-        dataset_folder = await create_dataset(request.images, captions)
-
-        # Update status to training
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
-                ("training", 0.3, job_id)
-            )
-            conn.commit()
-
-        # Convert sample_prompts list to comma-separated string if provided
-        sample_prompts_str = None
-        if request.sample_prompts:
-            sample_prompts_str = ",".join(request.sample_prompts)
-
-        # Train model
-        folder_url = await train_model(
-            dataset_folder=dataset_folder,
+        # Run the actual training
+        loop.run_until_complete(train_lora(
+            images=request.images,
             lora_name=request.lora_name,
             concept_sentence=request.concept_sentence,
             steps=request.steps,
@@ -468,17 +516,9 @@ async def run_training_job(job_id: str, request: TrainingRequest):
             rank=request.rank,
             model_type=request.model_type,
             low_vram=request.low_vram,
-            sample_prompts=sample_prompts_str,
+            sample_prompts=request.sample_prompts,
             advanced_options=request.advanced_options
-        )
-
-        # Update final status
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
-                ("completed", 1.0, folder_url, job_id)
-            )
-            conn.commit()
+        ))
 
     except Exception as e:
         logger.exception("Training job failed")
@@ -488,51 +528,41 @@ async def run_training_job(job_id: str, request: TrainingRequest):
                 ("failed", str(e), job_id)
             )
             conn.commit()
-        raise
+    finally:
+        loop.close()
 
-@app.post("/kill")
-async def kill_current_job():
-    """Kill the currently running job"""
-    with get_db() as conn:
-        # Get current running job
-        current_job = conn.execute(
-            "SELECT job_id, status, pid FROM jobs "
-            "WHERE status NOT IN ('completed', 'failed') "
-            "ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+def run_training_job(job_id: str, request: TrainingRequest):
+    """Background task to run the training job"""
+    try:
+        # Convert request to dict for pickling
+        request_dict = request.model_dump()
         
-        if not current_job:
-            raise HTTPException(
-                status_code=404, 
-                detail="No running job found"
-            )
+        # Set the start method to 'spawn' for better compatibility
+        multiprocessing.set_start_method('spawn', force=True)
         
-        job_id = current_job[0]
-        
-        # Try to terminate the process
-        if current_job[2]:  # if pid exists
-            try:
-                process = psutil.Process(current_job[2])
-                process.terminate()  # Try graceful termination first
-                
-                try:
-                    process.wait(timeout=5)
-                except psutil.TimeoutExpired:
-                    process.kill()  # Force kill if graceful termination fails
-                    
-            except psutil.NoSuchProcess:
-                logger.warning(f"Process {current_job[2]} not found")
-            except Exception as e:
-                logger.error(f"Error killing process: {e}")
-        
-        # Update job status to failed
-        conn.execute(
-            "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-            ("failed", "Job was killed by user", job_id)
+        # Run the training process
+        process = multiprocessing.Process(
+            target=run_training_process,
+            args=(job_id, request_dict)
         )
-        conn.commit()
+        process.start()
         
-        return {"message": "Current job terminated"}
+        # Update PID in database
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET pid = ? WHERE job_id = ?",
+                (process.pid, job_id)
+            )
+            conn.commit()
+            
+    except Exception as e:
+        logger.exception("Failed to start training process")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                ("failed", str(e), job_id)
+            )
+            conn.commit()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
@@ -582,10 +612,11 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobStatus(
-        status=result[0],
-        progress=result[1],
-        folder_url=result[2],
-        error=result[3]
+        job_id=result[0],
+        status=result[1],
+        progress=result[2],
+        folder_url=result[3],
+        error=result[4]
     )
 
 @app.get("/current", response_model=Optional[JobStatus])
@@ -602,11 +633,58 @@ async def get_current_job():
         return None
 
     return JobStatus(
+        job_id=result[0],
         status=result[1],
         progress=result[2],
         folder_url=result[3],
         error=result[4]
     )
+
+@app.post("/kill")
+async def kill_current_job():
+    """Kill the currently running job"""
+    with get_db() as conn:
+        # Get current running job
+        current_job = conn.execute(
+            "SELECT job_id, pid FROM jobs "
+            "WHERE status NOT IN ('completed', 'failed') "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        
+        if not current_job:
+            raise HTTPException(
+                status_code=404, 
+                detail="No running job found"
+            )
+        
+        job_id, pid = current_job
+        
+        # Try to terminate the process if PID exists
+        if pid:
+            try:
+                process = psutil.Process(pid)
+                # Try graceful termination first
+                process.terminate()
+                
+                try:
+                    process.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    # Force kill if graceful termination fails
+                    process.kill()
+                    
+            except psutil.NoSuchProcess:
+                logger.warning(f"Process {pid} not found")
+            except Exception as e:
+                logger.error(f"Error killing process: {e}")
+        
+        # Update job status to failed
+        conn.execute(
+            "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+            ("failed", "Job was killed by user", job_id)
+        )
+        conn.commit()
+        
+        return {"message": "Current job terminated"}
 
 # Database helper
 @contextmanager
@@ -629,6 +707,7 @@ def init_db():
                 progress REAL DEFAULT 0,
                 folder_url TEXT,
                 error TEXT,
+                pid INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
