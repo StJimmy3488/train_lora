@@ -27,9 +27,12 @@ logger = logging.getLogger(__name__)
 
 # Add at the top of utils.py
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
+os.environ["NCCL_P2P_DISABLE"] = "0"
+os.environ["NCCL_IB_DISABLE"] = "0"
 os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["OMP_NUM_THREADS"] = "8"
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
 def process_images_and_captions(images, concept_sentence=None):
     """Process uploaded images and generate captions if needed"""
@@ -284,34 +287,38 @@ async def train_model(
             "cache_to_disk": True,
             "load_in_memory": True,
             "shuffle": True,
-            "num_workers": 2,
+            "num_workers": 4,
             "persistent_workers": True,
-            "prefetch_factor": 2,
-            "pin_memory": True
+            "prefetch_factor": 4,
+            "pin_memory": True,
+            "max_resolution": 1024,
+            "batch_size": 16
         }]
 
         # Configure for single-process operation
         process_block["train"].update({
-            "dataloader_workers": 2,
+            "dataloader_workers": 4,
             "dataloader_timeout": 0,
-            "batch_size": 4,
-            "gradient_accumulation_steps": 4,
-            "mixed_precision": "fp16",
+            "batch_size": 16,
+            "gradient_accumulation_steps": 1,
+            "mixed_precision": "bf16",
             "seed": 42,
             "use_deterministic_algorithms": False,
             "num_processes": 1,
             "pin_memory": True,
-            "prefetch_factor": 2
+            "prefetch_factor": 4,
+            "learning_rate": lr * 4
         })
 
-        # Add environment configuration
+        # Optimize for high-end GPU
         process_block["environment"] = {
             "multiprocessing_context": "spawn",
             "torch_compile": True,
             "torch_inference_mode": True,
             "cudnn_benchmark": True,
             "deterministic_algorithms": False,
-            "cuda_launch_blocking": "0"
+            "cuda_launch_blocking": "0",
+            "max_memory": {0: "75GB"}
         }
 
         # Log the dataset configuration for debugging
@@ -321,9 +328,10 @@ async def train_model(
         
         process_block.update({
             "model": {
-                "low_vram": low_vram,
-                "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
-                "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None
+                "low_vram": False,
+                "attention_implementation": "flash_attention_2",
+                "gradient_checkpointing": False,
+                "enable_xformers_memory_efficient_attention": True
             },
             "train": {
                 "skip_first_sample": True,
@@ -446,3 +454,10 @@ def monitor_gpu():
         logger.info(f"GPU utilization: {torch.cuda.utilization()}%")
         logger.info(f"Memory used: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
         logger.info(f"Memory cached: {torch.cuda.memory_reserved() / 1024**2:.2f}MB")
+
+def monitor_training_performance():
+    if torch.cuda.is_available():
+        logger.info(f"GPU utilization: {torch.cuda.utilization()}%")
+        logger.info(f"Memory used: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
+        logger.info(f"Memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f}GB")
+        logger.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB")
