@@ -1,15 +1,21 @@
 import os
+# Force spawn method for multiprocessing
+os.environ["PYTHONPATH"] = os.getcwd()  # Ensure imports work in subprocess
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+import multiprocessing
+# Set start method before anything else
+multiprocessing.set_start_method('spawn', force=True)
+
 import torch.multiprocessing as mp
 # Environment variables must be set before any imports that might use CUDA
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
@@ -25,7 +31,6 @@ from utils import resolve_image_path, process_images_and_captions, create_datase
 import asyncio
 from multiprocessing import Process
 import os
-import multiprocessing
 import torch
 import psutil
 from functools import lru_cache
@@ -127,39 +132,31 @@ def init_db():
 
 def run_training_process(job_id: str, request_data: dict):
     """Run training in a completely isolated process"""
-    # Initialize multiprocessing properly
-    import torch.multiprocessing as mp
-    mp.set_sharing_strategy('file_system')
+    # Important: Reset any existing event loop configuration
+    import asyncio
+    try:
+        asyncio.get_event_loop().close()
+    except:
+        pass
     
-    # Initialize CUDA in the new process
-    if torch.cuda.is_available():
-        torch.cuda.init()
-        torch.cuda.set_device(0)
-        # Important: Initialize CUDA context
-        dummy_tensor = torch.zeros(1, device='cuda')
-        del dummy_tensor
-        logger.info(f"CUDA initialized: {torch.cuda.get_device_name(0)}")
-
-    # Create new event loop
+    # Create a new event loop for this process only
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Initialize CUDA in the new process context
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        torch.cuda.set_device(0)
+        logger.info(f"CUDA initialized in isolated process: {torch.cuda.get_device_name(0)}")
+
     try:
-        # Convert request data to TrainingRequest
-        request = TrainingRequest(**request_data)
-        
-        # Run training in try-except block
-        try:
-            loop.run_until_complete(run_training_job(job_id, request))
-        except Exception as e:
-            logger.error(f"Training failed: {e}", exc_info=True)
-            raise
+        # Run training in the isolated process
+        loop.run_until_complete(run_training_job(job_id, TrainingRequest(**request_data)))
     finally:
         loop.close()
-        # Cleanup CUDA
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
+
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest):
     """Start a new training job"""
@@ -187,15 +184,18 @@ async def start_training(request: TrainingRequest):
 
         # Create a completely isolated process with spawn
         ctx = multiprocessing.get_context('spawn')
+        
+        # Important: Pass minimal data to the new process
         process = ctx.Process(
             target=run_training_process,
             args=(job_id, request.model_dump()),
-            name=f"training-{job_id}"
+            name=f"training-{job_id}",
+            daemon=False  # Make sure it's not a daemon process
         )
         
         # Start the process
         process.start()
-        logger.info(f"Started training process with PID: {process.pid}")
+        logger.info(f"Started isolated training process with PID: {process.pid}")
         
         # Store the PID
         with get_db() as conn:

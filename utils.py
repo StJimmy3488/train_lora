@@ -310,13 +310,11 @@ async def train_model(
         # Optimize for high-end GPU
         process_block["environment"] = {
             "multiprocessing_context": "spawn",
-            "torch_compile": True,
-            "torch_inference_mode": True,
+            "torch_compile": False,
+            "torch_inference_mode": False,
             "cudnn_benchmark": True,
-            "deterministic_algorithms": False,
-            "cuda_launch_blocking": "0",
-            "shared_memory": True,
-            "max_memory": {0: "75GB"}
+            "deterministic_algorithms": True,
+            "cuda_launch_blocking": "1"
         }
 
         # Log the dataset configuration for debugging
