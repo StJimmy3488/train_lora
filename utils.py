@@ -289,24 +289,21 @@ async def train_model(
             "shuffle": True,
             "num_workers": 4,
             "persistent_workers": True,
-            "prefetch_factor": 4,
+            "prefetch_factor": 2,
             "pin_memory": True,
-            "max_resolution": 1024,
-            "batch_size": 16
+            "shared_memory": True
         }]
 
         # Configure for single-process operation
         process_block["train"].update({
             "dataloader_workers": 4,
-            "dataloader_timeout": 0,
             "batch_size": 16,
             "gradient_accumulation_steps": 1,
             "mixed_precision": "bf16",
             "seed": 42,
-            "use_deterministic_algorithms": False,
-            "num_processes": 1,
             "pin_memory": True,
-            "prefetch_factor": 4,
+            "prefetch_factor": 2,
+            "num_processes": 1,
             "learning_rate": lr * 4
         })
 
@@ -318,6 +315,7 @@ async def train_model(
             "cudnn_benchmark": True,
             "deterministic_algorithms": False,
             "cuda_launch_blocking": "0",
+            "shared_memory": True,
             "max_memory": {0: "75GB"}
         }
 
@@ -461,3 +459,27 @@ def monitor_training_performance():
         logger.info(f"Memory used: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
         logger.info(f"Memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f}GB")
         logger.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB")
+
+def create_dataloader(dataset, config):
+    """Create a properly configured DataLoader"""
+    try:
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=config["batch_size"],
+            num_workers=config["num_workers"],
+            persistent_workers=config["persistent_workers"],
+            prefetch_factor=config["prefetch_factor"],
+            pin_memory=config["pin_memory"],
+            shuffle=config["shuffle"],
+            multiprocessing_context='spawn',
+            drop_last=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to create DataLoader: {e}")
+        # Fallback to safe settings
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=config["batch_size"],
+            num_workers=0,
+            shuffle=config["shuffle"]
+        )

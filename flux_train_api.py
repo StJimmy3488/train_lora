@@ -1,4 +1,5 @@
 import os
+import torch.multiprocessing as mp
 # Environment variables must be set before any imports that might use CUDA
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
@@ -6,6 +7,10 @@ os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
 from typing import List, Optional
@@ -31,6 +36,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
+# Set multiprocessing start method
+mp.set_start_method('spawn', force=True)
 
 class ModelType(str, Enum):
     dev = "dev"
@@ -119,22 +126,39 @@ def init_db():
                 logger.error(f"Error adding pid column: {e}")
 
 def run_training_process(job_id: str, request_data: dict):
+    """Run training in a completely isolated process"""
+    # Initialize multiprocessing properly
     import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
     mp.set_sharing_strategy('file_system')
-
+    
+    # Initialize CUDA in the new process
     if torch.cuda.is_available():
         torch.cuda.init()
+        torch.cuda.set_device(0)
+        # Important: Initialize CUDA context
+        dummy_tensor = torch.zeros(1, device='cuda')
+        del dummy_tensor
         logger.info(f"CUDA initialized: {torch.cuda.get_device_name(0)}")
 
+    # Create new event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
-        loop.run_until_complete(run_training_job(job_id, TrainingRequest(**request_data)))
+        # Convert request data to TrainingRequest
+        request = TrainingRequest(**request_data)
+        
+        # Run training in try-except block
+        try:
+            loop.run_until_complete(run_training_job(job_id, request))
+        except Exception as e:
+            logger.error(f"Training failed: {e}", exc_info=True)
+            raise
     finally:
         loop.close()
-        torch.cuda.empty_cache()
+        # Cleanup CUDA
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest):
