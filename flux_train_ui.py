@@ -40,8 +40,6 @@ logging.basicConfig(
 import boto3
 from botocore.config import Config
 import os
-import psutil
-import asyncio
 from asyncio import create_task
 
 def get_s3_client():
@@ -597,7 +595,7 @@ async def get_job_status(job_id: str):
     """Get the status of a training job"""
     with get_db() as conn:
         result = conn.execute(
-            "SELECT status, progress, folder_url, error FROM jobs WHERE job_id = ?",
+            "SELECT job_id, status, progress, folder_url, error FROM jobs WHERE job_id = ?",
             (job_id,)
         ).fetchone()
 
