@@ -381,10 +381,6 @@ async def train_model(
         if job is None:
             raise RuntimeError(f"get_job() returned None for config path: {config_path}")
 
-        # Set environment variables before running the job
-        os.environ["PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION"] = "1"
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["PYTHONWARNINGS"] = "ignore"
 
         logger.info("Running job...")
         job.run()
