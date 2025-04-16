@@ -151,21 +151,25 @@ def process_images_and_captions(images, concept_sentence=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn",
-        torch_dtype=torch_dtype,
-        trust_remote_code=True
-    ).to(device)
-
-    processor = AutoProcessor.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn",
-        trust_remote_code=True
-    )
-
-    captions = []
-    local_image_paths = []
-
     try:
+        # Clear CUDA cache before loading model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        model = AutoModelForCausalLM.from_pretrained(
+            "multimodalart/Florence-2-large-no-flash-attn",
+            torch_dtype=torch_dtype,
+            trust_remote_code=True
+        ).to(device)
+
+        processor = AutoProcessor.from_pretrained(
+            "multimodalart/Florence-2-large-no-flash-attn",
+            trust_remote_code=True
+        )
+
+        captions = []
+        local_image_paths = []
+
         # Resolve URLs to local paths synchronously
         for image_item in images:
             local_path = requests.get(image_item, stream=True)
@@ -221,10 +225,13 @@ def process_images_and_captions(images, concept_sentence=None):
             if os.path.exists(path):
                 os.remove(path)
 
-        model.to("cpu")
-        del model
-        del processor
-
+        # Proper GPU memory cleanup
+        if torch.cuda.is_available():
+            model.to('cpu')
+            del model
+            del processor
+            torch.cuda.empty_cache()
+            
     logger.debug("Generated %d captions", len(captions))
     if len(captions) == 0:
         raise RuntimeError("No captions were generated from the images")
@@ -290,14 +297,16 @@ async def train_model(
     process_block = config["config"]["process"][0]
     process_block.update({
         "model": {
-            "low_vram": low_vram,
+            "low_vram": True,
             "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
             "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None
         },
         "train": {
             "skip_first_sample": True,
             "steps": int(steps),
-            "lr": float(lr)
+            "lr": float(lr),
+            "batch_size": 1,
+            "gradient_accumulation_steps": 4
         },
         "network": {
             "linear": int(rank),
@@ -340,6 +349,10 @@ async def train_model(
     with open(config_path, "w") as f:
         yaml.dump(config, f)
 
+    # Clear CUDA cache before starting training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     # Run training
     logger.info("Retrieving job with config path: %s", config_path)
     job = get_job(config_path, slugged_lora_name)
@@ -470,6 +483,8 @@ async def train_lora(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Add CUDA memory management environment variable
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     init_db()
     yield
 
