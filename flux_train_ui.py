@@ -193,26 +193,26 @@ def process_images_and_captions(images, concept_sentence=None):
             ).to(device, torch_dtype)
 
             generated_ids = model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=1024,
-                    num_beams=3
-                )
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3
+            )
 
             generated_text = processor.batch_decode(
                 generated_ids,
                 skip_special_tokens=False
             )[0]
 
-        parsed_answer = processor.post_process_generation(
+            parsed_answer = processor.post_process_generation(
                 generated_text,
                 task=prompt,
                 image_size=(image.width, image.height)
-        )
+            )
 
-        caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-        if concept_sentence:
-            caption = f"{caption} [trigger]"
+            caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
+            if concept_sentence:
+                caption = f"{caption} [trigger]"
 
             captions.append(caption)
             logger.debug("Caption generated: %s", caption)
@@ -223,28 +223,46 @@ def process_images_and_captions(images, concept_sentence=None):
             if os.path.exists(path):
                 os.remove(path)
 
-    model.to("cpu")
-    del model
-    del processor
+        model.to("cpu")
+        del model
+        del processor
+
+    logger.debug("Generated %d captions", len(captions))
+    if len(captions) == 0:
+        raise RuntimeError("No captions were generated from the images")
 
     return captions
 
 async def create_dataset(images, captions):
     """Create temporary dataset from images and captions"""
+    if len(images) != len(captions):
+        raise RuntimeError(f"Number of images ({len(images)}) does not match number of captions ({len(captions)})")
+        
     destination_folder = f"tmp_datasets/{uuid.uuid4()}"
     logger.info("Creating a dataset in folder: %s", destination_folder)
     os.makedirs(destination_folder, exist_ok=True)
 
     jsonl_file_path = os.path.join(destination_folder, "metadata.jsonl")
+    processed_count = 0
+    
     with open(jsonl_file_path, "a") as jsonl_file:
         for image_item, caption in zip(images, captions):
-            local_path = await resolve_image_path(image_item)
-            logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
-            new_image_path = shutil.copy(local_path, destination_folder)
-            file_name = os.path.basename(new_image_path)
-            data = {"file_name": file_name, "prompt": caption}
-            jsonl_file.write(json.dumps(data) + "\n")
-            logger.debug("Wrote to metadata.jsonl: %s", data)
+            try:
+                local_path = await resolve_image_path(image_item)
+                logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
+                new_image_path = shutil.copy(local_path, destination_folder)
+                file_name = os.path.basename(new_image_path)
+                data = {"file_name": file_name, "prompt": caption}
+                jsonl_file.write(json.dumps(data) + "\n")
+                logger.debug("Wrote to metadata.jsonl: %s", data)
+                processed_count += 1
+            except Exception as e:
+                logger.error(f"Failed to process image {image_item}: {e}")
+                raise
+
+    logger.info(f"Successfully processed {processed_count} images to dataset")
+    if processed_count == 0:
+        raise RuntimeError("No images were successfully processed for the dataset")
 
     return destination_folder
 
