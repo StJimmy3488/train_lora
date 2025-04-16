@@ -6,6 +6,12 @@ import json
 import yaml
 import logging
 import time  # Import the time module
+from typing import List, Optional
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from enum import Enum
+import sqlite3
+from contextlib import contextmanager
 
 from PIL import Image
 from dotenv import load_dotenv
@@ -15,7 +21,6 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from slugify import slugify
 from transformers import AutoProcessor, AutoModelForCausalLM
-import gradio as gr
 from botocore.config import Config
 
 sys.path.insert(0, os.getcwd())
@@ -135,10 +140,10 @@ def process_images_and_captions(images, concept_sentence=None):
     """Process uploaded images and generate captions if needed"""
     logger.debug("Processing images for captioning. Number of images: %d", len(images))
 
-    if len(images) < 2:
-        raise gr.Error("Please upload at least 2 images")
-    elif len(images) > 150:
-        raise gr.Error("Maximum 150 images allowed")
+    # if len(images) < 2:
+    #     raise gr.Error("Please upload at least 2 images")
+    # elif len(images) > 150:
+    #     raise gr.Error("Maximum 150 images allowed")
 
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -352,7 +357,7 @@ def train_model(
                 upload_runtime = time.time() - upload_start_time # Calculate upload runtime
                 logger.info(f"S3 upload completed in {upload_runtime:.2f} seconds.") # Log upload runtime
 
-                # Construct an HTTP-based “folder” URL on Timeweb S3
+                # Construct an HTTP-based "folder" URL on Timeweb S3
                 # s3_endpoint = os.environ.get("S3_ENDPOINT", "https://s3.timeweb.cloud").rstrip("/")
                 s3_folder_url = f"{s3_domain}/{s3_prefix}/"
                 logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
@@ -441,25 +446,185 @@ def train_lora(
         logger.debug("Final cleanup (check if tmp dirs are removed by train_model's finally).")
 
 
-# Gradio interface remains the same
-demo = gr.Interface(
-    fn=train_lora,
-    inputs=[
-        gr.File(file_count="multiple", label="Upload Images"),
-        gr.Textbox(label="LoRA Name"),
-        gr.Textbox(label="Trigger Word/Sentence (Optional)"),
-        gr.Number(label="Steps", value=1000),
-        gr.Number(label="Learning Rate", value=4e-4),
-        gr.Number(label="LoRA Rank", value=16),
-        gr.Radio(choices=["dev", "schnell"], value="dev", label="Model Type"),
-        gr.Checkbox(label="Low VRAM Mode", value=True),
-        gr.Textbox(label="Sample Prompts (Optional, comma-separated)"),
-        gr.Code(label="Advanced Options (YAML)", language="yaml")
-    ],
-    outputs=gr.JSON(),
-    title="FLUX LoRA Trainer API",
-    description="Train a FLUX LoRA model with your images"
-)
+# Initialize FastAPI app
+app = FastAPI(title="FLUX LoRA Trainer API")
+
+# Define enums and models
+class ModelType(str, Enum):
+    dev = "dev"
+    schnell = "schnell"
+
+class TrainingRequest(BaseModel):
+    images: List[str] = Field(..., description="List of image URLs to train on")
+    lora_name: str = Field(..., description="Name for the LoRA model")
+    concept_sentence: Optional[str] = Field(None, description="Optional trigger word/sentence")
+    steps: int = Field(default=1000, ge=100, le=10000, description="Number of training steps")
+    lr: float = Field(default=4e-4, gt=0, le=1, description="Learning rate")
+    rank: int = Field(default=16, ge=1, le=128, description="LoRA rank")
+    model_type: ModelType = Field(default=ModelType.dev, description="Model type (dev or schnell)")
+    low_vram: bool = Field(default=True, description="Enable low VRAM mode")
+    sample_prompts: Optional[List[str]] = Field(None, description="Optional sample prompts for testing")
+    advanced_options: Optional[str] = Field(None, description="Advanced YAML configuration")
+
+class TrainingResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+class JobStatus(BaseModel):
+    status: str
+    progress: float
+    folder_url: Optional[str] = None
+    error: Optional[str] = None
+
+async def run_training_job(job_id: str, request: TrainingRequest):
+    """Background task to run the training job"""
+    try:
+        # Update job status to processing
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
+                ("processing", 0.1, job_id)
+            )
+            conn.commit()
+
+        # Process images and generate captions
+        captions = process_images_and_captions(request.images, request.concept_sentence)
+
+        # Create dataset
+        dataset_folder = create_dataset(request.images, captions)
+
+        # Update status to training
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
+                ("training", 0.3, job_id)
+            )
+            conn.commit()
+
+        # Convert sample_prompts list to comma-separated string if provided
+        sample_prompts_str = None
+        if request.sample_prompts:
+            sample_prompts_str = ",".join(request.sample_prompts)
+
+        # Train model
+        folder_url = train_model(
+            dataset_folder=dataset_folder,
+            lora_name=request.lora_name,
+            concept_sentence=request.concept_sentence,
+            steps=request.steps,
+            lr=request.lr,
+            rank=request.rank,
+            model_type=request.model_type,
+            low_vram=request.low_vram,
+            sample_prompts=sample_prompts_str,
+            advanced_options=request.advanced_options
+        )
+
+        # Update final status
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
+                ("completed", 1.0, folder_url, job_id)
+            )
+            conn.commit()
+
+    except Exception as e:
+        logger.exception("Training job failed")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                ("failed", str(e), job_id)
+            )
+            conn.commit()
+        raise
+
+@app.post("/train", response_model=TrainingResponse)
+async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
+    """Start a new training job"""
+    # Check if there's already a running job
+    with get_db() as conn:
+        running_job = conn.execute(
+            "SELECT job_id FROM jobs WHERE status NOT IN ('completed', 'failed')"
+        ).fetchone()
+        
+        if running_job:
+            raise HTTPException(
+                status_code=409, 
+                detail="Another training job is already in progress"
+            )
+
+    # Create new job ID
+    job_id = str(uuid.uuid4())
+
+    # Initialize job in database
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO jobs (job_id, status, progress) VALUES (?, ?, ?)",
+            (job_id, "initializing", 0.0)
+        )
+        conn.commit()
+
+    # Start training in background
+    background_tasks.add_task(run_training_job, job_id, request)
+
+    return TrainingResponse(
+        job_id=job_id,
+        status="accepted",
+        message="Training job started successfully"
+    )
+
+@app.get("/train/{job_id}", response_model=JobStatus)
+async def get_job_status(job_id: str):
+    """Get the status of a training job"""
+    with get_db() as conn:
+        result = conn.execute(
+            "SELECT status, progress, folder_url, error FROM jobs WHERE job_id = ?",
+            (job_id,)
+        ).fetchone()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return JobStatus(
+        status=result[0],
+        progress=result[1],
+        folder_url=result[2],
+        error=result[3]
+    )
+
+# Database helper
+@contextmanager
+def get_db():
+    """Database connection context manager"""
+    conn = sqlite3.connect("jobs.db")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# Initialize database
+def init_db():
+    """Initialize the database with required tables"""
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                progress REAL DEFAULT 0,
+                folder_url TEXT,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    init_db()
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, show_error=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
