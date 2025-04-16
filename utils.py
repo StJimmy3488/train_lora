@@ -287,24 +287,28 @@ async def train_model(
             "cache_to_disk": True,
             "load_in_memory": True,
             "shuffle": True,
-            "num_workers": 4,
+            "num_workers": 2,
             "persistent_workers": True,
             "prefetch_factor": 2,
             "pin_memory": True,
-            "shared_memory": True
+            "max_memory": {"0": "70GB"},
+            "use_cached_latents": True,
+            "worker_init_fn": None,
+            "multiprocessing_context": "spawn"
         }]
 
         # Configure for single-process operation
         process_block["train"].update({
-            "dataloader_workers": 4,
+            "dataloader_workers": 2,
+            "dataloader_timeout": 120,
             "batch_size": 16,
             "gradient_accumulation_steps": 1,
             "mixed_precision": "bf16",
             "seed": 42,
             "pin_memory": True,
-            "prefetch_factor": 2,
-            "num_processes": 1,
-            "learning_rate": lr * 4
+            "gradient_checkpointing": True,
+            "use_cached_latents": True,
+            "prefetch_factor": 2
         })
 
         # Optimize for high-end GPU
@@ -313,8 +317,12 @@ async def train_model(
             "torch_compile": False,
             "torch_inference_mode": False,
             "cudnn_benchmark": True,
-            "deterministic_algorithms": True,
-            "cuda_launch_blocking": "1"
+            "deterministic_algorithms": False,
+            "cuda_launch_blocking": "0",
+            "cuda_device": "0",
+            "cuda_memory_fraction": 0.95,
+            "worker_init": True,
+            "shared_memory": True
         }
 
         # Log the dataset configuration for debugging

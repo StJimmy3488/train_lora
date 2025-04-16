@@ -12,11 +12,11 @@ multiprocessing.set_start_method('spawn', force=True)
 import torch.multiprocessing as mp
 # Environment variables must be set before any imports that might use CUDA
 os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
 from typing import List, Optional
@@ -43,6 +43,7 @@ logging.basicConfig(
 
 # Set multiprocessing start method
 mp.set_start_method('spawn', force=True)
+mp.set_sharing_strategy('file_system')
 
 class ModelType(str, Enum):
     dev = "dev"
@@ -132,26 +133,23 @@ def init_db():
 
 def run_training_process(job_id: str, request_data: dict):
     """Run training in a completely isolated process"""
-    # Important: Reset any existing event loop configuration
-    import asyncio
-    try:
-        asyncio.get_event_loop().close()
-    except:
-        pass
+    # Set process-specific settings
+    torch.set_num_threads(4)  # Limit torch threads
     
-    # Create a new event loop for this process only
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        # Initialize CUDA context
+        dummy = torch.zeros(1, device='cuda')
+        del dummy
+        torch.cuda.empty_cache()
+
+    # Create new event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Initialize CUDA in the new process context
-    if torch.cuda.is_available():
-        torch.cuda.init()
-        torch.cuda.set_device(0)
-        logger.info(f"CUDA initialized in isolated process: {torch.cuda.get_device_name(0)}")
-
     try:
-        # Run training in the isolated process
-        loop.run_until_complete(run_training_job(job_id, TrainingRequest(**request_data)))
+        request = TrainingRequest(**request_data)
+        loop.run_until_complete(run_training_job(job_id, request))
     finally:
         loop.close()
         if torch.cuda.is_available():
