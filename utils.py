@@ -258,10 +258,8 @@ async def train_model(
             "persistent_workers": True,
             "prefetch_factor": 2,
             "pin_memory": True,
-            "max_memory": {"0": "70GB"},
-            "use_cached_latents": True,
-            "worker_init_fn": None,
-            "multiprocessing_context": "spawn"
+            "multiprocessing_context": "spawn",
+            "drop_last": True
         }]
 
         # Configure for single-process operation
@@ -275,7 +273,8 @@ async def train_model(
             "pin_memory": True,
             "gradient_checkpointing": True,
             "use_cached_latents": True,
-            "prefetch_factor": 2
+            "prefetch_factor": 2,
+            "use_deterministic_algorithms": False
         })
 
         # Optimize for high-end GPU

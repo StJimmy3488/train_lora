@@ -147,6 +147,10 @@ def worker_init_fn(worker_id):
 def run_training_process(job_id: str, request_dict: dict):
     """The actual training process that runs in a separate process"""
     try:
+        # Set current process as non-daemon
+        current_process = mp.current_process()
+        current_process.daemon = False
+        
         # Reconstruct request object from dict
         request = TrainingRequest(**request_dict)
         
@@ -194,10 +198,11 @@ async def start_training(request: TrainingRequest):
             )
             conn.commit()
 
-        # Start the process without daemon flag
+        # Create process with daemon=False explicitly
         process = mp.Process(
             target=run_training_process,
             args=(job_id, request.model_dump()),
+            daemon=False  # Explicitly set daemon to False
         )
         process.start()
         
