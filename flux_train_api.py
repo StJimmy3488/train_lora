@@ -383,7 +383,7 @@ async def run_training_job(job_id: str, request: TrainingRequest):
             sample_prompts_str = ",".join(request.sample_prompts)
 
         # Train model
-        folder_url =  train_model(
+        folder_url = await train_model(
             dataset_folder=dataset_folder,
             lora_name=request.lora_name,
             concept_sentence=request.concept_sentence,

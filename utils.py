@@ -258,23 +258,24 @@ async def train_model(
             "persistent_workers": True,
             "prefetch_factor": 2,
             "pin_memory": True,
-            "multiprocessing_context": "spawn",
-            "generator": None,
+            "max_memory": {"0": "70GB"},
+            "use_cached_latents": True,
             "worker_init_fn": None,
+            "multiprocessing_context": "spawn"
         }]
 
         # Configure for single-process operation
         process_block["train"].update({
             "dataloader_workers": 2,
-            "dataloader_timeout": 60,
+            "dataloader_timeout": 120,
             "batch_size": 16,
             "gradient_accumulation_steps": 1,
             "mixed_precision": "bf16",
             "seed": 42,
             "pin_memory": True,
-            "generator": None,
-            "sampler": None,
-            "collate_fn": None,
+            "gradient_checkpointing": True,
+            "use_cached_latents": True,
+            "prefetch_factor": 2
         })
 
         # Optimize for high-end GPU
