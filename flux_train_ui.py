@@ -42,7 +42,7 @@ from botocore.config import Config
 import os
 import psutil
 import asyncio
-import multiprocessing
+from asyncio import create_task
 
 def get_s3_client():
     """Create S3-compatible client for Cloudflare R2"""
@@ -506,26 +506,19 @@ class JobStatus(BaseModel):
     folder_url: Optional[str] = None
     error: Optional[str] = None
 
-def run_training_process(job_id: str, request_dict: dict):
-    """The actual training process that runs in a separate process"""
+async def run_training_job(job_id: str, request: TrainingRequest):
+    """Background task to run the training job"""
     try:
-        # Reconstruct request object from dict
-        request = TrainingRequest(**request_dict)
-        
-        # Create a new event loop for this process
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Update job status to processing and store PID
+        # Update job status to processing
         with get_db() as conn:
             conn.execute(
-                "UPDATE jobs SET status = ?, progress = ?, pid = ? WHERE job_id = ?",
-                ("processing", 0.1, os.getpid(), job_id)
+                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
+                ("processing", 0.1, job_id)
             )
             conn.commit()
 
         # Run the actual training
-        loop.run_until_complete(train_lora(
+        result = await train_lora(
             images=request.images,
             lora_name=request.lora_name,
             concept_sentence=request.concept_sentence,
@@ -536,45 +529,27 @@ def run_training_process(job_id: str, request_dict: dict):
             low_vram=request.low_vram,
             sample_prompts=request.sample_prompts,
             advanced_options=request.advanced_options
-        ))
+        )
+
+        if result["status"] == "success":
+            # Update final status
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
+                    ("completed", 1.0, result["folder_url"], job_id)
+                )
+                conn.commit()
+        else:
+            # Update error status
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                    ("failed", result["message"], job_id)
+                )
+                conn.commit()
 
     except Exception as e:
         logger.exception("Training job failed")
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-                ("failed", str(e), job_id)
-            )
-            conn.commit()
-    finally:
-        loop.close()
-
-def run_training_job(job_id: str, request: TrainingRequest):
-    """Background task to run the training job"""
-    try:
-        # Convert request to dict for pickling
-        request_dict = request.model_dump()
-        
-        # Set the start method to 'spawn' for better compatibility
-        multiprocessing.set_start_method('spawn', force=True)
-        
-        # Run the training process
-        process = multiprocessing.Process(
-            target=run_training_process,
-            args=(job_id, request_dict)
-        )
-        process.start()
-        
-        # Update PID in database
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET pid = ? WHERE job_id = ?",
-                (process.pid, job_id)
-            )
-            conn.commit()
-            
-    except Exception as e:
-        logger.exception("Failed to start training process")
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
@@ -608,8 +583,8 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         )
         conn.commit()
 
-    # Start training in background
-    background_tasks.add_task(run_training_job, job_id, request)
+    # Start training in background using asyncio
+    create_task(run_training_job(job_id, request))
 
     return TrainingResponse(
         job_id=job_id,
@@ -664,7 +639,7 @@ async def kill_current_job():
     with get_db() as conn:
         # Get current running job
         current_job = conn.execute(
-            "SELECT job_id, pid FROM jobs "
+            "SELECT job_id FROM jobs "
             "WHERE status NOT IN ('completed', 'failed') "
             "ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
@@ -675,25 +650,7 @@ async def kill_current_job():
                 detail="No running job found"
             )
         
-        job_id, pid = current_job
-        
-        # Try to terminate the process if PID exists
-        if pid:
-            try:
-                process = psutil.Process(pid)
-                # Try graceful termination first
-                process.terminate()
-                
-                try:
-                    process.wait(timeout=5)
-                except psutil.TimeoutExpired:
-                    # Force kill if graceful termination fails
-                    process.kill()
-                    
-            except psutil.NoSuchProcess:
-                logger.warning(f"Process {pid} not found")
-            except Exception as e:
-                logger.error(f"Error killing process: {e}")
+        job_id = current_job[0]
         
         # Update job status to failed
         conn.execute(
@@ -725,7 +682,6 @@ def init_db():
                 progress REAL DEFAULT 0,
                 folder_url TEXT,
                 error TEXT,
-                pid INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
