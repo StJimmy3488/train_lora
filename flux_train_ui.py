@@ -12,17 +12,15 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from enum import Enum
 import sqlite3
 from contextlib import contextmanager, asynccontextmanager
-
+import psutil
 from PIL import Image
 from dotenv import load_dotenv
 import requests  
 import torch
-import boto3
-from botocore.exceptions import NoCredentialsError
 from slugify import slugify
+from s3_utils import upload_directory_to_s3
 
 from transformers import AutoProcessor, AutoModelForCausalLM
-from botocore.config import Config
 
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "ai-toolkit")
@@ -36,60 +34,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
-
-import boto3
-from botocore.config import Config
-import os
-
-def get_s3_client():
-    """Create S3-compatible client for Cloudflare R2"""
-    s3_endpoint = os.getenv("S3_ENDPOINT")
-    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-    region_name = os.getenv("AWS_REGION")
-
-    if not s3_endpoint or not aws_access_key_id or not aws_secret_access_key:
-        raise RuntimeError("Missing S3 credentials. Check .env file.")
-
-    config = Config(
-        signature_version="s3v4",  # ✅ Explicitly enforce Signature v4
-        retries={"max_attempts": 3, "mode": "standard"}
-    )
-
-    return boto3.client(
-        "s3",
-        endpoint_url=s3_endpoint,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=region_name,
-        config=config
-    )
-
-
-def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
-    """Uploads a directory to S3 while maintaining folder structure"""
-    logger.info("Uploading directory '%s' to S3 bucket '%s' with prefix '%s'.",
-                local_dir, bucket_name, s3_prefix)
-    try:
-        s3 = get_s3_client()
-        for root, _, files in os.walk(local_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                relative_path = os.path.relpath(local_path, local_dir)
-                s3_key = f"{s3_prefix}/{relative_path}"
-                logger.debug("Uploading file '%s' to '%s'.", local_path, s3_key)
-                s3.upload_file(local_path, bucket_name, s3_key)
-        return True
-    except NoCredentialsError:
-        logger.error("AWS credentials not available.")
-        return False
-    except Exception as e:
-        logger.exception("Error uploading to S3: %s", e)
-        return False
-    finally:
-        # Clean up local directory regardless of upload success
-        logger.debug("Removing local directory '%s'.", local_dir)
-        shutil.rmtree(local_dir, ignore_errors=True)
 
 
 async def resolve_image_path(image_item):
@@ -546,6 +490,50 @@ async def run_training_job(job_id: str, request: TrainingRequest):
             conn.commit()
         raise
 
+@app.post("/kill")
+async def kill_current_job():
+    """Kill the currently running job"""
+    with get_db() as conn:
+        # Get current running job
+        current_job = conn.execute(
+            "SELECT job_id, status, pid FROM jobs "
+            "WHERE status NOT IN ('completed', 'failed') "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        
+        if not current_job:
+            raise HTTPException(
+                status_code=404, 
+                detail="No running job found"
+            )
+        
+        job_id = current_job[0]
+        
+        # Try to terminate the process
+        if current_job[2]:  # if pid exists
+            try:
+                process = psutil.Process(current_job[2])
+                process.terminate()  # Try graceful termination first
+                
+                try:
+                    process.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    process.kill()  # Force kill if graceful termination fails
+                    
+            except psutil.NoSuchProcess:
+                logger.warning(f"Process {current_job[2]} not found")
+            except Exception as e:
+                logger.error(f"Error killing process: {e}")
+        
+        # Update job status to failed
+        conn.execute(
+            "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+            ("failed", "Job was killed by user", job_id)
+        )
+        conn.commit()
+        
+        return {"message": "Current job terminated"}
+
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
     """Start a new training job"""
@@ -598,6 +586,26 @@ async def get_job_status(job_id: str):
         progress=result[1],
         folder_url=result[2],
         error=result[3]
+    )
+
+@app.get("/current", response_model=Optional[JobStatus])
+async def get_current_job():
+    """Get information about the currently running job if any"""
+    with get_db() as conn:
+        result = conn.execute(
+            "SELECT job_id, status, progress, folder_url, error FROM jobs "
+            "WHERE status NOT IN ('completed', 'failed') "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+
+    if not result:
+        return None
+
+    return JobStatus(
+        status=result[1],
+        progress=result[2],
+        folder_url=result[3],
+        error=result[4]
     )
 
 # Database helper

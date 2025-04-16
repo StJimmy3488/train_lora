@@ -2,8 +2,6 @@ import boto3
 from botocore.config import Config
 import os
 import logging
-import shutil
-from botocore.exceptions import NoCredentialsError
 import asyncio
 logger = logging.getLogger(__name__)
 
