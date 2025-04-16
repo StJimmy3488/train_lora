@@ -1,99 +1,477 @@
 import os
-import sys
-import uuid
-import shutil
-import json
-import yaml
-import logging
-import time 
-from typing import List, Optional
-from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+# Force spawn method for multiprocessing
+os.environ["PYTHONPATH"] = os.getcwd()  # Ensure imports work in subprocess
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["TORCH_MULTIPROCESSING_SHARING_STRATEGY"] = "file_system"
+
+import torch.multiprocessing as mp
+# Environment variables must be set before any imports that might use CUDA
+os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, HttpUrl, field_validator
+from typing import List, Optional, Dict
 from enum import Enum
+import logging
 import sqlite3
 from contextlib import contextmanager, asynccontextmanager
-
-from PIL import Image
-from dotenv import load_dotenv
-import requests  
+import uuid
+from fastapi import BackgroundTasks
+import shutil
+from utils import resolve_image_path, process_images_and_captions, create_dataset, train_model
+import asyncio
+import os
 import torch
-import boto3
-from botocore.exceptions import NoCredentialsError
-from slugify import slugify
-
-from transformers import AutoProcessor, AutoModelForCausalLM
-from botocore.config import Config
-
-sys.path.insert(0, os.getcwd())
-sys.path.insert(0, "ai-toolkit")
-from toolkit.job import get_job
-
-load_dotenv()
+import psutil
+from functools import lru_cache
+from torch.utils.data import get_worker_info
+import weakref
+import requests
+import threading
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-    level=logging.DEBUG, 
+    level=logging.DEBUG,  # Changed to DEBUG logging level as suggested
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
+# Set multiprocessing start method
+mp.set_start_method('spawn', force=True)
+mp.set_sharing_strategy('file_system')
 
-import boto3
-from botocore.config import Config
-import os
-from asyncio import create_task
+# Modify the global tracking dictionary to store processes instead of threads
+running_processes: Dict[str, mp.Process] = {}
 
-def get_s3_client():
-    """Create S3-compatible client for Cloudflare R2"""
-    s3_endpoint = os.getenv("S3_ENDPOINT")
-    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-    region_name = os.getenv("AWS_REGION")
+class ModelType(str, Enum):
+    dev = "dev"
+    schnell = "schnell"
 
-    if not s3_endpoint or not aws_access_key_id or not aws_secret_access_key:
-        raise RuntimeError("Missing S3 credentials. Check .env file.")
+class TrainingRequest(BaseModel):
+    images: List[str]
+    lora_name: str
+    concept_sentence: Optional[str] = None
+    steps: int = 1000
+    lr: float = 4e-4
+    rank: int = 16
+    model_type: ModelType = ModelType.dev
+    low_vram: bool = True
+    sample_prompts: Optional[List[str]] = None
+    advanced_options: Optional[str] = None
 
-    config = Config(
-        signature_version="s3v4",  # ✅ Explicitly enforce Signature v4
-        retries={"max_attempts": 3, "mode": "standard"}
-    )
+    @field_validator('images')
+    @classmethod
+    def validate_images(cls, v: List[str]) -> List[str]:
+        for url in v:
+            if not (url.startswith('http://') or url.startswith('https://')):
+                raise ValueError(f"Invalid image URL: {url}. Must start with http:// or https://")
+        return v
 
-    return boto3.client(
-        "s3",
-        endpoint_url=s3_endpoint,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=region_name,
-        config=config
-    )
+class TrainingResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
 
+class TrainingStatus(BaseModel):
+    status: str
+    progress: Optional[float] = None
+    folder_url: Optional[str] = None
+    error: Optional[str] = None
 
-def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
-    """Uploads a directory to S3 while maintaining folder structure"""
-    logger.info("Uploading directory '%s' to S3 bucket '%s' with prefix '%s'.",
-                local_dir, bucket_name, s3_prefix)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    init_db()
+    logger.info("Database initialized")
+    yield
+    # Shutdown
+    pass
+
+app = FastAPI(
+    title="FLUX LoRA Trainer API",
+    description="Train FLUX LoRA models with your images",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Replace in-memory dictionary with SQLite
+@contextmanager
+def get_db():
+    conn = sqlite3.connect('jobs.db')
+    conn.row_factory = sqlite3.Row
     try:
-        s3 = get_s3_client()
-        for root, _, files in os.walk(local_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                relative_path = os.path.relpath(local_path, local_dir)
-                s3_key = f"{s3_prefix}/{relative_path}"
-                logger.debug("Uploading file '%s' to '%s'.", local_path, s3_key)
-                s3.upload_file(local_path, bucket_name, s3_key)
-        return True
-    except NoCredentialsError:
-        logger.error("AWS credentials not available.")
-        return False
-    except Exception as e:
-        logger.exception("Error uploading to S3: %s", e)
-        return False
+        yield conn
     finally:
-        # Clean up local directory regardless of upload success
-        logger.debug("Removing local directory '%s'.", local_dir)
-        shutil.rmtree(local_dir, ignore_errors=True)
+        conn.close()
 
+def init_db():
+    with get_db() as conn:
+        # First create the table if it doesn't exist (without pid column to maintain compatibility)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT,
+                progress REAL,
+                folder_url TEXT,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Then add the pid column if it doesn't exist
+        try:
+            conn.execute('ALTER TABLE jobs ADD COLUMN pid INTEGER')
+            logger.info("Added pid column to jobs table")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" in str(e):
+                logger.debug("pid column already exists")
+            else:
+                logger.error(f"Error adding pid column: {e}")
 
-async def resolve_image_path(image_item):
+# Add this function for worker initialization
+def worker_init_fn(worker_id):
+    """Initialize worker process"""
+    worker_info = get_worker_info()
+    if worker_info is not None:
+        # Set worker-specific settings
+        torch.set_num_threads(1)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+
+def run_training_process(job_id: str, request_dict: dict):
+    """The actual training process that runs in a separate process"""
+    try:
+        # Reconstruct request object from dict
+        request = TrainingRequest(**request_dict)
+        
+        # Create new event loop for async operations
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the training job
+        loop.run_until_complete(run_training_job(job_id, request))
+        
+    except Exception as e:
+        logger.exception("Training job failed")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                ("failed", str(e), job_id)
+            )
+            conn.commit()
+    finally:
+        loop.close()
+
+@app.post("/train", response_model=TrainingResponse)
+async def start_training(request: TrainingRequest):
+    """Start a new training job"""
+    # Check if there's already a running job
+    with get_db() as conn:
+        running_job = conn.execute(
+            "SELECT job_id FROM jobs WHERE status NOT IN ('completed', 'failed')"
+        ).fetchone()
+        
+        if running_job:
+            raise HTTPException(
+                status_code=409, 
+                detail="Another training job is already in progress"
+            )
+    
+    job_id = str(uuid.uuid4())
+    
+    try:
+        # Store initial job status
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO jobs (job_id, status, progress) VALUES (?, ?, ?)",
+                (job_id, "initializing", 0.0)
+            )
+            conn.commit()
+
+        # Start the process
+        process = mp.Process(
+            target=run_training_process,
+            args=(job_id, request.model_dump()),
+            daemon=True
+        )
+        process.start()
+        
+        # Store the process reference
+        running_processes[job_id] = process
+        
+        # Store the PID
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET pid = ? WHERE job_id = ?",
+                (process.pid, job_id)
+            )
+            conn.commit()
+
+        return TrainingResponse(
+            job_id=job_id,
+            status="accepted",
+            message="Training job started successfully"
+        )
+
+    except Exception as e:
+        logger.exception("Failed to start training job")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                ("failed", str(e), job_id)
+            )
+            conn.commit()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/status/{job_id}", response_model=TrainingStatus)
+async def get_training_status(job_id: str):
+    """Get the status of a training job"""
+    with get_db() as conn:
+        job = conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", 
+            (job_id,)
+        ).fetchone()
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        return TrainingStatus(
+            status=job['status'],
+            progress=job['progress'],
+            folder_url=job['folder_url'],
+            error=job['error']
+        )
+
+@app.get("/current-job")
+async def get_current_job():
+    """Get the ID of the currently running job, if any"""
+    with get_db() as conn:
+        running_job = conn.execute(
+            "SELECT job_id, status, progress FROM jobs WHERE status NOT IN ('completed', 'failed')"
+        ).fetchone()
+        
+        if running_job:
+            return {
+                "job_id": running_job['job_id'],
+                "status": running_job['status'],
+                "progress": running_job['progress']
+            }
+        return {"message": "No job currently running"}
+
+@app.post("/kill/{job_id}")
+async def kill_job(job_id: str):
+    """Kill a running job"""
+    with get_db() as conn:
+        # Check if job exists
+        job = conn.execute(
+            "SELECT status, pid FROM jobs WHERE job_id = ?", 
+            (job_id,)
+        ).fetchone()
+        
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        if job['status'] in ('completed', 'failed'):
+            raise HTTPException(status_code=400, detail="Job is not running")
+
+        # Get the process
+        process = running_processes.get(job_id)
+        
+        try:
+            # Try to terminate the process and all its children
+            if process and process.is_alive():
+                parent = psutil.Process(process.pid)
+                children = parent.children(recursive=True)
+                
+                # Terminate children first
+                for child in children:
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                
+                # Terminate parent process
+                parent.terminate()
+                
+                # Wait for processes to terminate
+                gone, alive = psutil.wait_procs([parent] + children, timeout=3)
+                
+                # If any process is still alive, kill it
+                for p in alive:
+                    try:
+                        p.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                
+                # Clean up process from tracking
+                running_processes.pop(job_id, None)
+                
+            elif job['pid']:
+                # Try to kill by PID if process object not found
+                try:
+                    parent = psutil.Process(job['pid'])
+                    children = parent.children(recursive=True)
+                    
+                    # Terminate children first
+                    for child in children:
+                        try:
+                            child.terminate()
+                        except psutil.NoSuchProcess:
+                            pass
+                    
+                    # Terminate parent process
+                    parent.terminate()
+                    
+                    # Wait for processes to terminate
+                    gone, alive = psutil.wait_procs([parent] + children, timeout=3)
+                    
+                    # If any process is still alive, kill it
+                    for p in alive:
+                        try:
+                            p.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                            
+                except psutil.NoSuchProcess:
+                    logger.warning(f"Process {job['pid']} not found")
+                
+        except Exception as e:
+            logger.error(f"Error killing process: {e}")
+        
+        finally:
+            # Update job status to failed
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                ("failed", "Job was killed by user", job_id)
+            )
+            conn.commit()
+            
+            # Clean up any temporary files
+            try:
+                dataset_folder = f"tmp_datasets/{job_id}"
+                if os.path.exists(dataset_folder):
+                    shutil.rmtree(dataset_folder, ignore_errors=True)
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup: {cleanup_error}")
+        
+        return {"message": f"Job {job_id} terminated"}
+
+async def run_training_job(job_id: str, request: TrainingRequest):
+    """Run the training job in the background"""
+    try:
+        # Helper function to check if job should stop
+        def should_stop():
+            with get_db() as conn:
+                status = conn.execute(
+                    "SELECT status FROM jobs WHERE job_id = ?",
+                    (job_id,)
+                ).fetchone()
+                return status and status['status'] == 'stopping'
+
+        # Update job status - downloading images
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
+                ("downloading_images", 0.1, job_id)
+            )
+            conn.commit()
+
+        # Check for stop signal throughout the process
+        if should_stop():
+            return
+
+        # Rest of your existing code, but add checks for should_stop() at key points
+        # For example:
+        
+        images = []
+        for image_url in request.images:
+            if should_stop():
+                return
+            local_path = resolve_image_path(image_url)
+            images.append(local_path)
+
+        if should_stop():
+            return
+
+        # Continue with the rest of your existing code, adding should_stop() checks
+        # at appropriate intervals...
+
+        # Process images and generate captions
+        captions = process_images_and_captions(images, request.concept_sentence)
+
+        # Update status - creating dataset
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
+                ("creating_dataset", 0.4, job_id)
+            )
+            conn.commit()
+
+        # Create dataset
+        dataset_folder = await create_dataset(images, captions)
+
+        # Update status - training
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
+                ("training", 0.5, job_id)
+            )
+            conn.commit()
+
+        # Convert sample_prompts from list to comma-separated string if provided
+        sample_prompts_str = None
+        if request.sample_prompts:
+            sample_prompts_str = ",".join(request.sample_prompts)
+
+        # Train model
+        folder_url = await train_model(
+            dataset_folder=dataset_folder,
+            lora_name=request.lora_name,
+            concept_sentence=request.concept_sentence,
+            steps=request.steps,
+            lr=request.lr,
+            rank=request.rank,
+            model_type=request.model_type,
+            low_vram=request.low_vram,
+            sample_prompts=sample_prompts_str,
+            advanced_options=request.advanced_options
+        )
+
+        # Update final status
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
+                ("completed", 1.0, folder_url, job_id)
+            )
+            conn.commit()
+
+        logger.info(f"Training completed successfully. Model available at: {folder_url}")
+
+    except Exception as e:
+        logger.exception("Training job failed")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                ("failed", str(e), job_id)
+            )
+            conn.commit()
+    finally:
+        # Clean up process reference
+        running_processes.pop(job_id, None)
+        # Clean up any temporary files
+        try:
+            if 'dataset_folder' in locals():
+                shutil.rmtree(dataset_folder, ignore_errors=True)
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
+
+def resolve_image_path(image_item):
     """Handle multiple possible 'image' input formats"""
     if not image_item:
         raise HTTPException(
@@ -130,7 +508,6 @@ async def resolve_image_path(image_item):
                     detail=f"Failed to download image from URL {image_item}: {str(ex)}"
                 )
 
-
         # Handle local paths
         if os.path.exists(image_item):
             return image_item
@@ -145,546 +522,11 @@ async def resolve_image_path(image_item):
         detail=f"Unsupported image format: {type(image_item)}"
     )
 
-def process_images_and_captions(images, concept_sentence=None):
-    logger.debug("Processing images for captioning. Number of images: %d", len(images))
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16
-
-    model = AutoModelForCausalLM.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn",
-        torch_dtype=torch_dtype,
-        trust_remote_code=True
-    ).to(device)
-
-    processor = AutoProcessor.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn",
-        trust_remote_code=True
-    )
-
-    captions = []
-    local_image_paths = []
-
-    try:
-        # Resolve URLs to local paths synchronously
-        for image_item in images:
-            local_path = requests.get(image_item, stream=True)
-            local_path.raise_for_status()
-
-            os.makedirs("tmp_downloads", exist_ok=True)
-            file_path = os.path.join("tmp_downloads", f"{uuid.uuid4()}.png")
-
-            with open(file_path, "wb") as f:
-                for chunk in local_path.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            local_image_paths.append(file_path)
-
-        for image_path in local_image_paths:
-            image = Image.open(image_path).convert("RGB")
-
-            prompt = "<DETAILED_CAPTION>"
-            inputs = processor(
-                text=prompt,
-                images=image,
-                return_tensors="pt"
-            ).to(device, torch_dtype)
-
-            generated_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=3
-            )
-
-            generated_text = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=False
-            )[0]
-
-            parsed_answer = processor.post_process_generation(
-                generated_text,
-                task=prompt,
-                image_size=(image.width, image.height)
-            )
-
-            caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-            if concept_sentence:
-                caption = f"{caption} [trigger]"
-
-            captions.append(caption)
-            logger.debug("Caption generated: %s", caption)
-
-    finally:
-        # Cleanup downloaded images
-        for path in local_image_paths:
-            if os.path.exists(path):
-                os.remove(path)
-
-        model.to("cpu")
-        del model
-        del processor
-
-    logger.debug("Generated %d captions", len(captions))
-    if len(captions) == 0:
-        raise RuntimeError("No captions were generated from the images")
-
-    return captions
-
-async def create_dataset(images, captions):
-    """Create temporary dataset from images and captions"""
-    if len(images) != len(captions):
-        raise RuntimeError(f"Number of images ({len(images)}) does not match number of captions ({len(captions)})")
-        
-    destination_folder = f"tmp_datasets/{uuid.uuid4()}"
-    logger.info("Creating a dataset in folder: %s", destination_folder)
-    os.makedirs(destination_folder, exist_ok=True)
-
-    jsonl_file_path = os.path.join(destination_folder, "metadata.jsonl")
-    processed_count = 0
-    
-    with open(jsonl_file_path, "a") as jsonl_file:
-        for image_item, caption in zip(images, captions):
-            try:
-                local_path = await resolve_image_path(image_item)
-                logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
-                new_image_path = shutil.copy(local_path, destination_folder)
-                file_name = os.path.basename(new_image_path)
-                data = {"file_name": file_name, "prompt": caption}
-                jsonl_file.write(json.dumps(data) + "\n")
-                logger.debug("Wrote to metadata.jsonl: %s", data)
-                processed_count += 1
-            except Exception as e:
-                logger.error(f"Failed to process image {image_item}: {e}")
-                raise
-
-    logger.info(f"Successfully processed {processed_count} images to dataset")
-    if processed_count == 0:
-        raise RuntimeError("No images were successfully processed for the dataset")
-
-    return destination_folder
-
-async def train_model(
-    dataset_folder,
-    lora_name,
-    concept_sentence=None,
-    steps=1000,
-    lr=4e-4,
-    rank=16,
-    model_type="dev",
-    low_vram=True,
-    sample_prompts=None,
-    advanced_options=None
-):
-    """Train the model and store exclusively in S3, returning a folder URL."""
-    slugged_lora_name = slugify(lora_name)
-    logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
-
-    # Load default config
-    logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
-    with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
-        config = yaml.safe_load(f)
-
-    # Update configuration
-    config["config"]["name"] = slugged_lora_name
-    process_block = config["config"]["process"][0]
-    process_block.update({
-        "model": {
-            "low_vram": low_vram,
-            "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
-            "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None
-        },
-        "train": {
-            "skip_first_sample": True,
-            "steps": int(steps),
-            "lr": float(lr)
-        },
-        "network": {
-            "linear": int(rank),
-            "linear_alpha": int(rank)
-        },
-        "datasets": [{"folder_path": dataset_folder}],
-        "save": {
-            "output_dir": f"tmp_models/{slugged_lora_name}",
-            "push_to_hub": False  # Disable Hugging Face push
-        }
-    })
-
-    if concept_sentence:
-        logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
-        process_block["trigger_word"] = concept_sentence
-
-    if sample_prompts:
-        logger.debug("Sample prompts provided. Will enable sampling.")
-        process_block["train"]["disable_sampling"] = False
-        process_block["sample"].update({
-            "sample_every": steps,
-            "sample_steps": 28 if model_type == "dev" else 4,
-            "prompts": sample_prompts
-        })
-    else:
-        logger.debug("No sample prompts provided. Disabling sampling.")
-        process_block["train"]["disable_sampling"] = True
-
-    if advanced_options:
-        logger.debug("Merging advanced_options YAML into config.")
-        config["config"]["process"][0] = recursive_update(
-            config["config"]["process"][0],
-            yaml.safe_load(advanced_options)
-        )
-
-    # Save config
-    config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
-    logger.debug("Saving updated config to: %s", config_path)
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, "w") as f:
-        yaml.dump(config, f)
-
-    # Run training
-    logger.info("Retrieving job with config path: %s", config_path)
-    job = get_job(config_path, slugged_lora_name)
-
-    logger.debug("job object => %s", job)
-    if job is None:
-        raise RuntimeError(f"get_job() returned None for config path: {config_path}. Please check your job definition.")
-
-    s3_folder_url = None # Initialize s3_folder_url outside try block
-
-    try: # Added try-except block around job.run() and job.cleanup()
-        job_start_time = time.time() # Timing start for job.run()
-        logger.info("Running job...")
-        job.run()
-        job_runtime = time.time() - job_start_time # Calculate job runtime
-        logger.info(f"Job run completed in {job_runtime:.2f} seconds.") # Log job runtime
-
-        cleanup_start_time = time.time() # Timing start for job.cleanup()
-        logger.info("Cleaning up job...")
-        job.cleanup()
-        cleanup_runtime = time.time() - cleanup_start_time # Calculate cleanup runtime
-        logger.info(f"Job cleanup completed in {cleanup_runtime:.2f} seconds.") # Log cleanup runtime
-
-
-        # Upload to S3
-        bucket_name = os.environ.get("S3_BUCKET")
-        s3_domain = os.getenv("S3_DOMAIN", "https://r2.syntx.ai")
-        local_model_dir = f"output/{slugged_lora_name}"
-
-
-        if bucket_name and os.path.exists(local_model_dir):
-            s3_prefix = f"loras/flux/{slugged_lora_name}"
-            logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
-            upload_start_time = time.time() # Timing start for S3 upload
-            logger.info("Starting S3 upload...")
-            if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
-                upload_runtime = time.time() - upload_start_time # Calculate upload runtime
-                logger.info(f"S3 upload completed in {upload_runtime:.2f} seconds.") # Log upload runtime
-
-                # Construct an HTTP-based "folder" URL on Timeweb S3
-                # s3_endpoint = os.environ.get("S3_ENDPOINT", "https://s3.timeweb.cloud").rstrip("/")
-                s3_folder_url = f"{s3_domain}/{s3_prefix}/"
-                logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            else:
-                raise RuntimeError("upload_directory_to_s3 returned False indicating failure.") # Explicitly raise error if upload fails
-        else:
-            logger.warning("No S3_BUCKET set or local_model_dir does not exist. Skipping upload.")
-            raise RuntimeError("S3 bucket not configured or model directory missing, cannot complete training.") # Raise error as S3 URL is essential
-
-    except Exception as e_train_job: # Catch exceptions from job.run(), job.cleanup(), or S3 upload
-        logger.error(f"Error during training job execution in train_model: {e_train_job}", exc_info=True)
-        raise RuntimeError(f"Training job failed: {e_train_job}") from e_train_job # Re-raise to be caught by train_lora's except
-
-    finally: # Cleanup always, regardless of training success or failure, and *before* returning
-        # Cleanup
-        logger.debug("Removing dataset folder: %s", dataset_folder)
-        shutil.rmtree(dataset_folder, ignore_errors=True)
-        logger.debug("Removing config file: %s", config_path)
-        os.remove(config_path)
-
-
-    if not s3_folder_url: # Check again after the try-except-finally block, in case S3 upload failed inside try
-        msg = "Failed to obtain S3 folder URL after training, possibly due to upload failure or S3 configuration issues."
-        logger.error(msg)
-        raise RuntimeError(msg)
-
-    return s3_folder_url
-
-
-def recursive_update(d, u):
-    """Recursively update nested dictionaries"""
-    for k, v in u.items():
-        if isinstance(v, dict) and v:
-            d[k] = recursive_update(d.get(k, {}), v)
-        else:
-            d[k] = v
-    return d
-
-async def train_lora(
-    images,
-    lora_name,
-    concept_sentence=None,
-    steps=1000,
-    lr=4e-4,
-    rank=16,
-    model_type="dev",
-    low_vram=True,
-    sample_prompts=None,
-    advanced_options=None
-):
-    """Main training workflow with improved logging and error handling."""
-    logger.info("Initiating train_lora with the following parameters: "
-                "lora_name=%s, concept_sentence=%s, steps=%s, lr=%s, rank=%s, model_type=%s, low_vram=%s, sample_prompts=%s",
-                lora_name, concept_sentence, steps, lr, rank, model_type, low_vram, sample_prompts)
-
-    try:
-        logger.info("1. Process images and captions.")
-        captions = process_images_and_captions(images, concept_sentence)
-
-        logger.info("2. Create dataset from images and captions.")
-        dataset_folder = await create_dataset(images, captions)
-
-        logger.info("3. Train the model using train_model function.")
-        folder_url = await train_model(
-            dataset_folder,
-    lora_name,
-    concept_sentence,
-    steps,
-    lr,
-    rank,
-            model_type,
-    low_vram,
-            sample_prompts,
-            advanced_options
-        )
-        logger.info("Training complete. Folder URL: %s", folder_url)
-        return {"status": "success", "folder_url": folder_url}
-    except RuntimeError as e_rt: # Catch RuntimeErrors specifically from train_model or other critical functions
-        logger.error(f"RuntimeError in train_lora (likely training or S3 upload failure): {e_rt}")
-        return {"status": "error", "message": str(e_rt)} # Return specific RuntimeError message
-    except Exception as e: # Catch any other unexpected exceptions in train_lora itself
-        logger.exception("Unexpected error in train_lora: %s", e) # Log full exception with traceback
-        return {"status": "error", "message": "An unexpected error occurred during training. Check server logs for details."} # More generic message for client
-    finally:
-        # Cleanup temporary directories - moved to train_model's finally block to ensure cleanup even if train_model fails.
-        logger.debug("Final cleanup (check if tmp dirs are removed by train_model's finally).")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    yield
-
-app = FastAPI(title="FLUX LoRA Trainer API", lifespan=lifespan)
-
-# Define enums and models
-class ModelType(str, Enum):
-    dev = "dev"
-    schnell = "schnell"
-
-class TrainingRequest(BaseModel):
-    images: List[str] = Field(..., description="List of image URLs to train on")
-    lora_name: str = Field(..., description="Name for the LoRA model")
-    concept_sentence: Optional[str] = Field(None, description="Optional trigger word/sentence")
-    steps: int = Field(default=1000, ge=100, le=10000, description="Number of training steps")
-    lr: float = Field(default=4e-4, gt=0, le=1, description="Learning rate")
-    rank: int = Field(default=16, ge=1, le=128, description="LoRA rank")
-    model_type: ModelType = Field(default=ModelType.dev, description="Model type (dev or schnell)")
-    low_vram: bool = Field(default=True, description="Enable low VRAM mode")
-    sample_prompts: Optional[List[str]] = Field(None, description="Optional sample prompts for testing")
-    advanced_options: Optional[str] = Field(None, description="Advanced YAML configuration")
-
-class TrainingResponse(BaseModel):
-    job_id: str
-    status: str
-    message: str
-
-class JobStatus(BaseModel):
-    job_id: Optional[str] = None
-    status: str
-    progress: float
-    folder_url: Optional[str] = None
-    error: Optional[str] = None
-
-async def run_training_job(job_id: str, request: TrainingRequest):
-    """Background task to run the training job"""
-    try:
-        # Update job status to processing
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, progress = ? WHERE job_id = ?",
-                ("processing", 0.1, job_id)
-            )
-            conn.commit()
-
-        # Run the actual training
-        result = await train_lora(
-            images=request.images,
-            lora_name=request.lora_name,
-            concept_sentence=request.concept_sentence,
-            steps=request.steps,
-            lr=request.lr,
-            rank=request.rank,
-            model_type=request.model_type,
-            low_vram=request.low_vram,
-            sample_prompts=request.sample_prompts,
-            advanced_options=request.advanced_options
-        )
-
-        if result["status"] == "success":
-            # Update final status
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
-                    ("completed", 1.0, result["folder_url"], job_id)
-                )
-                conn.commit()
-        else:
-            # Update error status
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-                    ("failed", result["message"], job_id)
-                )
-                conn.commit()
-
-    except Exception as e:
-        logger.exception("Training job failed")
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-                ("failed", str(e), job_id)
-            )
-            conn.commit()
-
-@app.post("/train", response_model=TrainingResponse)
-async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
-    """Start a new training job"""
-    # Check if there's already a running job
-    with get_db() as conn:
-        running_job = conn.execute(
-            "SELECT job_id FROM jobs WHERE status NOT IN ('completed', 'failed')"
-        ).fetchone()
-        
-        if running_job:
-            raise HTTPException(
-                status_code=409, 
-                detail="Another training job is already in progress"
-            )
-
-    # Create new job ID
-    job_id = str(uuid.uuid4())
-
-    # Initialize job in database
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO jobs (job_id, status, progress) VALUES (?, ?, ?)",
-            (job_id, "initializing", 0.0)
-        )
-        conn.commit()
-
-    # Start training in background using asyncio
-    create_task(run_training_job(job_id, request))
-
-    return TrainingResponse(
-        job_id=job_id,
-        status="accepted",
-        message="Training job started successfully"
-    )
-
-@app.get("/status/{job_id}", response_model=JobStatus)
-async def get_job_status(job_id: str):
-    """Get the status of a training job"""
-    with get_db() as conn:
-        result = conn.execute(
-            "SELECT job_id, status, progress, folder_url, error FROM jobs WHERE job_id = ?",
-            (job_id,)
-        ).fetchone()
-
-    if not result:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return JobStatus(
-        job_id=result[0],
-        status=result[1],
-        progress=result[2],
-        folder_url=result[3],
-        error=result[4]
-    )
-
-@app.get("/current", response_model=Optional[JobStatus])
-async def get_current_job():
-    """Get information about the currently running job if any"""
-    with get_db() as conn:
-        result = conn.execute(
-            "SELECT job_id, status, progress, folder_url, error FROM jobs "
-            "WHERE status NOT IN ('completed', 'failed') "
-            "ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-
-    if not result:
-        return None
-
-    return JobStatus(
-        job_id=result[0],
-        status=result[1],
-        progress=result[2],
-        folder_url=result[3],
-        error=result[4]
-    )
-
-@app.post("/kill")
-async def kill_current_job():
-    """Kill the currently running job"""
-    with get_db() as conn:
-        # Get current running job
-        current_job = conn.execute(
-            "SELECT job_id FROM jobs "
-            "WHERE status NOT IN ('completed', 'failed') "
-            "ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-        
-        if not current_job:
-            raise HTTPException(
-                status_code=404, 
-                detail="No running job found"
-            )
-        
-        job_id = current_job[0]
-        
-        # Update job status to failed
-        conn.execute(
-            "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-            ("failed", "Job was killed by user", job_id)
-        )
-        conn.commit()
-        
-        return {"message": "Current job terminated"}
-
-# Database helper
-@contextmanager
-def get_db():
-    """Database connection context manager"""
-    conn = sqlite3.connect("jobs.db")
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-# Initialize database
-def init_db():
-    """Initialize the database with required tables"""
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                progress REAL DEFAULT 0,
-                folder_url TEXT,
-                error TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
+# Add health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=7860, workers=1)
