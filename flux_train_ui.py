@@ -5,17 +5,17 @@ import shutil
 import json
 import yaml
 import logging
-import time  # Import the time module
+import time 
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from enum import Enum
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 
 from PIL import Image
 from dotenv import load_dotenv
-import requests  # <-- NEW import for downloading URLs
+import requests  
 import torch
 import boto3
 from botocore.exceptions import NoCredentialsError
@@ -29,15 +29,10 @@ sys.path.insert(0, "ai-toolkit")
 from toolkit.job import get_job
 
 load_dotenv()
-# Debug: Print loaded environment variables
 
-
-# ----------------------------------------
-# Setup Python's Built-in Logging
-# ----------------------------------------
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG logging level as suggested
+    level=logging.DEBUG, 
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
@@ -96,9 +91,7 @@ def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
         logger.debug("Removing local directory '%s'.", local_dir)
         shutil.rmtree(local_dir, ignore_errors=True)
 
-# --------------------------------------------------------------------
-# Helper: Resolve a single image input (dict/string/URL) to local path
-# --------------------------------------------------------------------
+
 async def resolve_image_path(image_item):
     """Handle multiple possible 'image' input formats"""
     if not image_item:
@@ -456,8 +449,12 @@ async def train_lora(
         logger.debug("Final cleanup (check if tmp dirs are removed by train_model's finally).")
 
 
-# Initialize FastAPI app
-app = FastAPI(title="FLUX LoRA Trainer API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="FLUX LoRA Trainer API", lifespan=lifespan)
 
 # Define enums and models
 class ModelType(str, Enum):
@@ -584,7 +581,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         message="Training job started successfully"
     )
 
-@app.get("/train/{job_id}", response_model=JobStatus)
+@app.get("/status/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
     """Get the status of a training job"""
     with get_db() as conn:
@@ -628,12 +625,6 @@ def init_db():
             )
         """)
         conn.commit()
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database on startup"""
-    init_db()
 
 if __name__ == "__main__":
     import uvicorn
