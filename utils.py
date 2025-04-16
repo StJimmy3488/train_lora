@@ -281,6 +281,21 @@ def train_model(
         "save": {
             "output_dir": f"tmp_models/{slugged_lora_name}",
             "push_to_hub": False  # Disable Hugging Face push
+        },
+        "environment": {
+            "multiprocessing_context": "spawn",
+            "torch_compile": False,
+            "torch_inference_mode": False,
+            "cudnn_benchmark": False,
+            "deterministic_algorithms": True,
+            "cuda_launch_blocking": "1",
+            "process_isolation": True  # If your toolkit supports this
+        },
+        "train": {
+            "dataloader_workers": 0,
+            "num_workers": 0,
+            "persistent_workers": False,
+            "prefetch_factor": None
         }
     })
 
@@ -352,7 +367,7 @@ def train_model(
                 upload_runtime = time.time() - upload_start_time # Calculate upload runtime
                 logger.info(f"S3 upload completed in {upload_runtime:.2f} seconds.") # Log upload runtime
 
-                # Construct an HTTP-based “folder” URL on Timeweb S3
+                # Construct an HTTP-based "folder" URL on Timeweb S3
                 s3_endpoint = os.environ.get("S3_ENDPOINT", "https://s3.timeweb.cloud").rstrip("/")
                 s3_folder_url = f"{s3_domain}/{s3_prefix}/"
                 logger.info("Model folder successfully uploaded to: %s", s3_folder_url)

@@ -1,3 +1,11 @@
+import os
+# Environment variables must be set before any imports that might use CUDA
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
 from typing import List, Optional
@@ -111,67 +119,26 @@ def init_db():
                 logger.error(f"Error adding pid column: {e}")
 
 def run_training_process(job_id: str, request_data: dict):
-    """Run training in a separate process"""
-    # Set up logging in the new process
-    logging.basicConfig(level=logging.DEBUG)
-    logger = logging.getLogger(__name__)
-    
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
+    mp.set_sharing_strategy('file_system')
+
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        logger.info(f"CUDA initialized: {torch.cuda.get_device_name(0)}")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     try:
-        # Set environment variables to control torch multiprocessing
-        os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
-        os.environ['OMP_NUM_THREADS'] = '1'
-        
-        # Initialize torch multiprocessing settings
-        import torch.multiprocessing as mp
-        mp.set_start_method('spawn', force=True)
-        mp.set_sharing_strategy('file_system')
-        
-        # Initialize CUDA if available
-        if torch.cuda.is_available():
-            logger.info("Initializing CUDA in child process")
-            torch.cuda.init()
-            logger.info(f"CUDA initialized. Device: {torch.cuda.get_device_name(0)}")
-
-        # Convert dict back to TrainingRequest
-        request = TrainingRequest(**request_data)
-        
-        # Create a new event loop for this process
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            loop.run_until_complete(run_training_job(job_id, request))
-        finally:
-            loop.close()
-            
-    except Exception as e:
-        logger.error(f"Training process failed: {e}", exc_info=True)
-        try:
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-                    ("failed", str(e), job_id)
-                )
-                conn.commit()
-        except Exception as db_error:
-            logger.error(f"Failed to update job status: {db_error}")
+        loop.run_until_complete(run_training_job(job_id, TrainingRequest(**request_data)))
     finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+        loop.close()
+        torch.cuda.empty_cache()
+        
 @app.post("/train", response_model=TrainingResponse)
-async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
+async def start_training(request: TrainingRequest):
     """Start a new training job"""
-    # Add request validation caching
-    @lru_cache(maxsize=100)
-    def validate_image_url(url: str) -> bool:
-        return url.startswith(('http://', 'https://'))
-    
-    # Validate all URLs in parallel
-    validation_tasks = [validate_image_url(url) for url in request.images]
-    if not all(validation_tasks):
-        raise HTTPException(status_code=400, detail="Invalid image URLs")
-
     # Check if there's already a running job
     with get_db() as conn:
         running_job = conn.execute(
@@ -194,10 +161,8 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             )
             conn.commit()
 
-        # Create a new context for the process
+        # Create a completely isolated process with spawn
         ctx = multiprocessing.get_context('spawn')
-        
-        # Start training in a separate process with specific context
         process = ctx.Process(
             target=run_training_process,
             args=(job_id, request.model_dump()),
@@ -206,18 +171,15 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         
         # Start the process
         process.start()
-        
         logger.info(f"Started training process with PID: {process.pid}")
         
-        try:
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET pid = ? WHERE job_id = ?",
-                    (process.pid, job_id)
-                )
-                conn.commit()
-        except sqlite3.OperationalError as e:
-            logger.warning(f"Could not update process ID in database: {e}")
+        # Store the PID
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET pid = ? WHERE job_id = ?",
+                (process.pid, job_id)
+            )
+            conn.commit()
         
         return TrainingResponse(
             job_id=job_id,
@@ -414,28 +376,5 @@ async def health_check():
     return {"status": "healthy"}
 
 if __name__ == "__main__":
-    try:
-        # Set environment variables for the main process
-        os.environ['PYTORCH_ENABLE_WORKER_BIN_IDENTIFICATION'] = '1'
-        os.environ['OMP_NUM_THREADS'] = '1'
-        
-        # Initialize multiprocessing settings
-        multiprocessing.set_start_method('spawn')
-        
-        # Initialize torch multiprocessing settings
-        import torch.multiprocessing as mp
-        mp.set_sharing_strategy('file_system')
-        
-        # Initialize CUDA in the main process
-        if torch.cuda.is_available():
-            torch.cuda.init()
-            logger.info(f"CUDA initialized in main process. Device: {torch.cuda.get_device_name(0)}")
-        
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=7860)
-    except RuntimeError as e:
-        if "context has already been set" in str(e):
-            # Ignore if context is already set
-            pass
-        else:
-            raise 
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860, workers=1)
