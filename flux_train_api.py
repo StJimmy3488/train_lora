@@ -194,11 +194,10 @@ async def start_training(request: TrainingRequest):
             )
             conn.commit()
 
-        # Start the process
+        # Start the process without daemon flag
         process = mp.Process(
             target=run_training_process,
             args=(job_id, request.model_dump()),
-            daemon=True
         )
         process.start()
         
@@ -284,68 +283,45 @@ async def kill_job(job_id: str):
         process = running_processes.get(job_id)
         
         try:
-            # Try to terminate the process and all its children
             if process and process.is_alive():
-                parent = psutil.Process(process.pid)
-                children = parent.children(recursive=True)
-                
-                # Terminate children first
-                for child in children:
-                    try:
-                        child.terminate()
-                    except psutil.NoSuchProcess:
-                        pass
-                
-                # Terminate parent process
-                parent.terminate()
-                
-                # Wait for processes to terminate
-                gone, alive = psutil.wait_procs([parent] + children, timeout=3)
-                
-                # If any process is still alive, kill it
-                for p in alive:
-                    try:
-                        p.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-                
-                # Clean up process from tracking
-                running_processes.pop(job_id, None)
-                
-            elif job['pid']:
-                # Try to kill by PID if process object not found
+                # Get the parent process and all its children
                 try:
-                    parent = psutil.Process(job['pid'])
+                    parent = psutil.Process(process.pid)
                     children = parent.children(recursive=True)
                     
-                    # Terminate children first
+                    # Kill children first
                     for child in children:
                         try:
-                            child.terminate()
+                            child.kill()  # Use kill() instead of terminate()
                         except psutil.NoSuchProcess:
                             pass
                     
-                    # Terminate parent process
-                    parent.terminate()
+                    # Kill parent process
+                    parent.kill()  # Use kill() instead of terminate()
                     
-                    # Wait for processes to terminate
-                    gone, alive = psutil.wait_procs([parent] + children, timeout=3)
+                    # Clean up process from tracking
+                    process.join(timeout=1)  # Give it a second to clean up
+                    running_processes.pop(job_id, None)
                     
-                    # If any process is still alive, kill it
-                    for p in alive:
-                        try:
-                            p.kill()
-                        except psutil.NoSuchProcess:
-                            pass
-                            
                 except psutil.NoSuchProcess:
-                    logger.warning(f"Process {job['pid']} not found")
-                
+                    logger.warning(f"Process {process.pid} not found")
+                except Exception as e:
+                    logger.error(f"Error killing process tree: {e}")
+                    
+            elif job['pid']:
+                # Fallback to killing by PID
+                try:
+                    os.kill(job['pid'], 9)  # SIGKILL
+                except ProcessLookupError:
+                    logger.warning(f"PID {job['pid']} not found")
+                except Exception as e:
+                    logger.error(f"Error killing process by PID: {e}")
+                    
         except Exception as e:
-            logger.error(f"Error killing process: {e}")
-        
+            logger.error(f"Error during process termination: {e}")
+            
         finally:
-            # Update job status to failed
+            # Always update the job status
             conn.execute(
                 "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
                 ("failed", "Job was killed by user", job_id)
