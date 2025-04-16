@@ -4,6 +4,8 @@ os.environ["PYTHONPATH"] = os.getcwd()  # Ensure imports work in subprocess
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["TORCH_MULTIPROCESSING_SHARING_STRATEGY"] = "file_system"
 
 import multiprocessing
 # Set start method before anything else
@@ -16,7 +18,6 @@ os.environ['OMP_NUM_THREADS'] = '4'
 os.environ['MKL_NUM_THREADS'] = '4'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl, field_validator
 from typing import List, Optional
@@ -34,6 +35,8 @@ import os
 import torch
 import psutil
 from functools import lru_cache
+from torch.utils.data import get_worker_info
+import weakref
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -131,29 +134,56 @@ def init_db():
             else:
                 logger.error(f"Error adding pid column: {e}")
 
+# Add this function for worker initialization
+def worker_init_fn(worker_id):
+    """Initialize worker process"""
+    worker_info = get_worker_info()
+    if worker_info is not None:
+        # Set worker-specific settings
+        torch.set_num_threads(1)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+
 def run_training_process(job_id: str, request_data: dict):
     """Run training in a completely isolated process"""
-    # Set process-specific settings
-    torch.set_num_threads(4)  # Limit torch threads
+    # Set process start method
+    mp.set_start_method('spawn', force=True)
     
-    if torch.cuda.is_available():
-        torch.cuda.set_device(0)
-        # Initialize CUDA context
-        dummy = torch.zeros(1, device='cuda')
-        del dummy
-        torch.cuda.empty_cache()
-
+    # Clear any existing event loop
+    try:
+        asyncio.get_event_loop().close()
+    except:
+        pass
+    
     # Create new event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
+        # Initialize CUDA in the new process
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            torch.cuda.set_device(0)
+            # Create and delete a dummy tensor
+            dummy = torch.zeros(1, device='cuda')
+            del dummy
+            torch.cuda.empty_cache()
+
+        # Convert request data to TrainingRequest
         request = TrainingRequest(**request_data)
+        
+        # Run training
         loop.run_until_complete(run_training_job(job_id, request))
+    except Exception as e:
+        logger.error(f"Training failed: {e}", exc_info=True)
+        raise
     finally:
+        # Cleanup
         loop.close()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # Clear any remaining weak references
+        weakref.WeakKeyDictionary().clear()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest):

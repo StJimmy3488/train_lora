@@ -38,116 +38,83 @@ def process_images_and_captions(images, concept_sentence=None):
     """Process uploaded images and generate captions if needed"""
     logger.debug("Processing images for captioning. Number of images: %d", len(images))
 
-    if len(images) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload at least 2 images"
-        )
-    elif len(images) > 150:
-        raise HTTPException(
-            status_code=400,
-            detail="Maximum 150 images allowed"
-        )
+    # if len(images) < 2:
+    #     raise gr.Error("Please upload at least 2 images")
+    # elif len(images) > 150:
+    #     raise gr.Error("Maximum 150 images allowed")
 
-    # Use CUDA if available
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 if device == "cuda" else torch.float32
-    
-    logger.info(f"Using device: {device} with dtype: {torch_dtype}")
+    torch_dtype = torch.float16
 
-    # Add memory tracking
-    if torch.cuda.is_available():
-        initial_memory = torch.cuda.memory_allocated()
-        logger.debug(f"Initial GPU memory: {initial_memory / 1024**2:.2f}MB")
+    logger.info("Loading AutoModelForCausalLM from 'multimodalart/Florence-2-large-no-flash-attn'.")
 
+    model = AutoModelForCausalLM.from_pretrained(
+        "multimodalart/Florence-2-large-no-flash-attn",
+        torch_dtype=torch_dtype,
+        trust_remote_code=True
+    ).to(device)
+
+    processor = AutoProcessor.from_pretrained(
+        "multimodalart/Florence-2-large-no-flash-attn",
+        trust_remote_code=True
+    )
+
+    logger.debug("processor.post_process_generation => %s", processor.post_process_generation)
+    captions = []
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            "multimodalart/Florence-2-large-no-flash-attn",
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-            device_map=device
-        ).to(device)
-
-        processor = AutoProcessor.from_pretrained(
-            "multimodalart/Florence-2-large-no-flash-attn",
-            trust_remote_code=True
-        )
-
-        # Increase batch size if GPU memory allows
-        batch_size = 8  # Increased from 4
-        
-        # Pre-load all images before processing
-        all_pil_images = []
         for image_path in images:
+            logger.debug("Processing image: %s", image_path)
             if isinstance(image_path, str):
-                # Add basic image validation/optimization
                 image = Image.open(image_path).convert("RGB")
-                # Resize large images to reasonable dimensions
-                if max(image.size) > 2048:
-                    image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-                all_pil_images.append(image)
-        
-        # Process in larger batches
-        captions = []
-        for i in range(0, len(all_pil_images), batch_size):
-            batch_pil_images = all_pil_images[i:i + batch_size]
-            
-            # Process batch
+                image.load()
+
             prompt = "<DETAILED_CAPTION>"
             inputs = processor(
-                text=[prompt] * len(batch_pil_images),
-                images=batch_pil_images,
+                text=prompt,
+                images=image,
                 return_tensors="pt"
             ).to(device, torch_dtype)
 
-            with torch.amp.autocast('cuda') if device == "cuda" else nullcontext():
-                generated_ids = model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=1024,
-                    num_beams=3
-                )
+            logger.debug("Generating tokens with model.generate(...)")
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3
+            )
 
-                generated_texts = processor.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True
-                )
+            generated_text = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=False
+            )[0]
+            logger.debug("Generated text: %s", generated_text)
 
-            # Process generated texts
-            for idx, (generated_text, pil_image) in enumerate(zip(generated_texts, batch_pil_images)):
+            try:
+                logger.debug("Calling processor.post_process_generation(...)")
                 parsed_answer = processor.post_process_generation(
                     generated_text,
                     task=prompt,
-                    image_size=(pil_image.width, pil_image.height)
+                    image_size=(image.width, image.height)
                 )
+            except Exception as ex:
+                logger.error("Error calling post_process_generation: %s", ex, exc_info=True)
+                raise
 
-                caption = parsed_answer["<DETAILED_CAPTION>"].replace(
-                    "The image shows ", ""
-                )
-                if concept_sentence:
-                    caption = f"{caption} [trigger]"
-                captions.append(caption)
-                logger.debug("Final caption for image %d: %s", i + idx, caption)
+            logger.debug("Parsed answer: %s", parsed_answer)
 
-            # Clear memory more aggressively
-            for pil_image in batch_pil_images:
-                pil_image.close()
-            del inputs
-            torch.cuda.empty_cache()
-
+            caption = parsed_answer["<DETAILED_CAPTION>"].replace(
+                "The image shows ", ""
+            )
+            if concept_sentence:
+                caption = f"{caption} [trigger]"
+            captions.append(caption)
+            logger.debug("Final caption for image: %s", caption)
     finally:
-        # Cleanup
-        if 'model' in locals():
-            model.to("cpu")
-            del model
-        if 'processor' in locals():
-            del processor
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        if torch.cuda.is_available():
-            final_memory = torch.cuda.memory_allocated()
-            logger.debug(f"Final GPU memory: {final_memory / 1024**2:.2f}MB")
+        logger.debug("Cleaning up model and processor from GPU/Memory.")
+        model.to("cpu")
+        del model
+        del processor
 
     logger.info("Generated %d captions.", len(captions))
     return captions
@@ -291,24 +258,23 @@ async def train_model(
             "persistent_workers": True,
             "prefetch_factor": 2,
             "pin_memory": True,
-            "max_memory": {"0": "70GB"},
-            "use_cached_latents": True,
+            "multiprocessing_context": "spawn",
+            "generator": None,
             "worker_init_fn": None,
-            "multiprocessing_context": "spawn"
         }]
 
         # Configure for single-process operation
         process_block["train"].update({
             "dataloader_workers": 2,
-            "dataloader_timeout": 120,
+            "dataloader_timeout": 60,
             "batch_size": 16,
             "gradient_accumulation_steps": 1,
             "mixed_precision": "bf16",
             "seed": 42,
             "pin_memory": True,
-            "gradient_checkpointing": True,
-            "use_cached_latents": True,
-            "prefetch_factor": 2
+            "generator": None,
+            "sampler": None,
+            "collate_fn": None,
         })
 
         # Optimize for high-end GPU
