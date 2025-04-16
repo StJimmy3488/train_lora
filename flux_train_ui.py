@@ -152,19 +152,10 @@ async def resolve_image_path(image_item):
     )
 
 def process_images_and_captions(images, concept_sentence=None):
-    """Process uploaded images and generate captions if needed"""
     logger.debug("Processing images for captioning. Number of images: %d", len(images))
-
-    # if len(images) < 2:
-    #     raise gr.Error("Please upload at least 2 images")
-    # elif len(images) > 150:
-    #     raise gr.Error("Maximum 150 images allowed")
-
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16
-
-    logger.info("Loading AutoModelForCausalLM from 'multimodalart/Florence-2-large-no-flash-attn'.")
 
     model = AutoModelForCausalLM.from_pretrained(
         "multimodalart/Florence-2-large-no-flash-attn",
@@ -177,14 +168,26 @@ def process_images_and_captions(images, concept_sentence=None):
         trust_remote_code=True
     )
 
-    logger.debug("processor.post_process_generation => %s", processor.post_process_generation)
     captions = []
+    local_image_paths = []
+
     try:
-        for image_path in images:
-            logger.debug("Processing image: %s", image_path)
-            if isinstance(image_path, str):
-                image = Image.open(image_path).convert("RGB")
-                image.load()
+        # Resolve URLs to local paths synchronously
+        for image_item in images:
+            local_path = requests.get(image_item, stream=True)
+            local_path.raise_for_status()
+
+            os.makedirs("tmp_downloads", exist_ok=True)
+            file_path = os.path.join("tmp_downloads", f"{uuid.uuid4()}.png")
+
+            with open(file_path, "wb") as f:
+                for chunk in local_path.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            local_image_paths.append(file_path)
+
+        for image_path in local_image_paths:
+            image = Image.open(image_path).convert("RGB")
 
             prompt = "<DETAILED_CAPTION>"
             inputs = processor(
@@ -193,7 +196,6 @@ def process_images_and_captions(images, concept_sentence=None):
                 return_tensors="pt"
             ).to(device, torch_dtype)
 
-            logger.debug("Generating tokens with model.generate(...)")
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
@@ -205,35 +207,30 @@ def process_images_and_captions(images, concept_sentence=None):
                 generated_ids,
                 skip_special_tokens=False
             )[0]
-            logger.debug("Generated text: %s", generated_text)
 
-            try:
-                logger.debug("Calling processor.post_process_generation(...)")
-                parsed_answer = processor.post_process_generation(
-                    generated_text,
-                    task=prompt,
-                    image_size=(image.width, image.height)
-                )
-            except Exception as ex:
-                logger.error("Error calling post_process_generation: %s", ex, exc_info=True)
-                raise
-
-            logger.debug("Parsed answer: %s", parsed_answer)
-
-            caption = parsed_answer["<DETAILED_CAPTION>"].replace(
-                "The image shows ", ""
+            parsed_answer = processor.post_process_generation(
+                generated_text,
+                task=prompt,
+                image_size=(image.width, image.height)
             )
+
+            caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
             if concept_sentence:
                 caption = f"{caption} [trigger]"
+
             captions.append(caption)
-            logger.debug("Final caption for image: %s", caption)
+            logger.debug("Caption generated: %s", caption)
+
     finally:
-        logger.debug("Cleaning up model and processor from GPU/Memory.")
+        # Cleanup downloaded images
+        for path in local_image_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
         model.to("cpu")
         del model
         del processor
 
-    logger.info("Generated %d captions.", len(captions))
     return captions
 
 async def create_dataset(images, captions):
