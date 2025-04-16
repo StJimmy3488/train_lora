@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # print(f"GPU device: {torch.cuda.get_device_name(0)}")
 # print(f"GPU compute capability: {torch.cuda.get_device_capability(0)}")
 
+# Add at the top of utils.py
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG"] = "INFO"
 
 def process_images_and_captions(images, concept_sentence=None):
     """Process uploaded images and generate captions if needed"""
@@ -275,37 +280,37 @@ async def train_model(
         # Configure dataset with absolute path and metadata file
         process_block["datasets"] = [{
             "folder_path": dataset_folder,
-            "metadata_file": "metadata.jsonl",  # Specify the metadata file name
-            "cache_to_disk": False,
+            "metadata_file": "metadata.jsonl",
+            "cache_to_disk": True,
             "load_in_memory": True,
-            "shuffle": False,
-            "num_workers": 0,
-            "persistent_workers": False,
-            "prefetch_factor": None,
-            "pin_memory": False
+            "shuffle": True,
+            "num_workers": 2,
+            "persistent_workers": True,
+            "prefetch_factor": 2,
+            "pin_memory": True
         }]
 
         # Configure for single-process operation
         process_block["train"].update({
-            "dataloader_workers": 5,
+            "dataloader_workers": 2,
             "dataloader_timeout": 0,
-            "batch_size": 1,
-            "gradient_accumulation_steps": 1,
-            "mixed_precision": "no",
+            "batch_size": 4,
+            "gradient_accumulation_steps": 4,
+            "mixed_precision": "fp16",
             "seed": 42,
-            "use_deterministic_algorithms": True,
+            "use_deterministic_algorithms": False,
             "num_processes": 1,
-            "pin_memory": False,
-            "prefetch_factor": None
+            "pin_memory": True,
+            "prefetch_factor": 2
         })
 
         # Add environment configuration
         process_block["environment"] = {
-            "multiprocessing_context": "fork",
-            "torch_compile": False,
-            "torch_inference_mode": False,
+            "multiprocessing_context": "spawn",
+            "torch_compile": True,
+            "torch_inference_mode": True,
             "cudnn_benchmark": True,
-            "deterministic_algorithms": True,
+            "deterministic_algorithms": False,
             "cuda_launch_blocking": "0"
         }
 
@@ -435,3 +440,9 @@ async def train_model(
                 
         except Exception as cleanup_error:
             logger.error("Error during cleanup: %s", str(cleanup_error))
+
+def monitor_gpu():
+    if torch.cuda.is_available():
+        logger.info(f"GPU utilization: {torch.cuda.utilization()}%")
+        logger.info(f"Memory used: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
+        logger.info(f"Memory cached: {torch.cuda.memory_reserved() / 1024**2:.2f}MB")
