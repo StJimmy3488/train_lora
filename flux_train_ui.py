@@ -20,6 +20,7 @@ import torch
 import boto3
 from botocore.exceptions import NoCredentialsError
 from slugify import slugify
+import aiohttp
 from transformers import AutoProcessor, AutoModelForCausalLM
 from botocore.config import Config
 
@@ -98,43 +99,56 @@ def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
 # --------------------------------------------------------------------
 # Helper: Resolve a single image input (dict/string/URL) to local path
 # --------------------------------------------------------------------
-def resolve_image_path(image_item):
-    """
-    Handle multiple possible 'image' input formats:
-      - A Gradio file dict with 'name' key
-      - A local path string
-      - A URL (starting with http/https)
-    Returns a local file path to be used by Pillow or shutil.copy
-    """
-    # If it's a Gradio-style dictionary
+async def resolve_image_path(image_item):
+    """Handle multiple possible 'image' input formats"""
+    if not image_item:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty image path or URL provided"
+        )
+
+    # If it's a dict with 'name' key
     if isinstance(image_item, dict) and "name" in image_item:
+        if not image_item["name"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty image name in dictionary"
+            )
         return image_item["name"]
 
-    # If it's a string, it might be a local path or a URL
+    # If it's a string (URL or path)
     if isinstance(image_item, str):
-        # Check if it looks like an http(s) URL
-        if image_item.lower().startswith("http://") or image_item.lower().startswith("https://"):
-            # Download to tmp_downloads
+        # Handle URLs
+        if image_item.lower().startswith(("http://", "https://")):
             os.makedirs("tmp_downloads", exist_ok=True)
             local_name = os.path.join("tmp_downloads", f"{uuid.uuid4()}.png")
-            logger.debug("Downloading image from URL: %s --> %s", image_item, local_name)
+            
             try:
-                r = requests.get(image_item, stream=True)
-                r.raise_for_status()
-                with open(local_name, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(image_item) as response:
+                        response.raise_for_status()
+                        with open(local_name, "wb") as f:
+                            f.write(await response.read())
                 return local_name
             except Exception as ex:
-                raise RuntimeError(f"Failed to download image from URL {image_item}: {ex}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to download image from URL {image_item}: {str(ex)}"
+                )
 
-        # Otherwise assume it's a local path
-        if not os.path.exists(image_item):
-            raise ValueError(f"Image path does not exist: {image_item}")
-        return image_item
+        # Handle local paths
+        if os.path.exists(image_item):
+            return image_item
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image file not found: {image_item}"
+            )
 
-    # If none of the above, it's invalid
-    raise ValueError(f"Unsupported image type or format: {image_item}")
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported image format: {type(image_item)}"
+    )
 
 def process_images_and_captions(images, concept_sentence=None):
     """Process uploaded images and generate captions if needed"""
@@ -221,7 +235,7 @@ def process_images_and_captions(images, concept_sentence=None):
     logger.info("Generated %d captions.", len(captions))
     return captions
 
-def create_dataset(images, captions):
+async def create_dataset(images, captions):
     """Create temporary dataset from images and captions"""
     destination_folder = f"tmp_datasets/{uuid.uuid4()}"
     logger.info("Creating a dataset in folder: %s", destination_folder)
@@ -230,10 +244,8 @@ def create_dataset(images, captions):
     jsonl_file_path = os.path.join(destination_folder, "metadata.jsonl")
     with open(jsonl_file_path, "a") as jsonl_file:
         for image_item, caption in zip(images, captions):
-            # Convert 'image_item' to local path (could be URL or dict)
-            local_path = resolve_image_path(image_item)
+            local_path = await resolve_image_path(image_item)
             logger.debug("Copying %s to dataset folder %s", local_path, destination_folder)
-
             new_image_path = shutil.copy(local_path, destination_folder)
             file_name = os.path.basename(new_image_path)
             data = {"file_name": file_name, "prompt": caption}
@@ -242,7 +254,7 @@ def create_dataset(images, captions):
 
     return destination_folder
 
-def train_model(
+async def train_model(
     dataset_folder,
     lora_name,
     concept_sentence=None,
@@ -396,7 +408,7 @@ def recursive_update(d, u):
             d[k] = v
     return d
 
-def train_lora(
+async def train_lora(
     images,
     lora_name,
     concept_sentence=None,
@@ -418,10 +430,10 @@ def train_lora(
         captions = process_images_and_captions(images, concept_sentence)
 
         logger.info("2. Create dataset from images and captions.")
-        dataset_folder = create_dataset(images, captions)
+        dataset_folder = await create_dataset(images, captions)
 
         logger.info("3. Train the model using train_model function.")
-        folder_url = train_model(  # Call the modified train_model function
+        folder_url = await train_model(
             dataset_folder,
             lora_name,
             concept_sentence,
@@ -492,7 +504,7 @@ async def run_training_job(job_id: str, request: TrainingRequest):
         captions = process_images_and_captions(request.images, request.concept_sentence)
 
         # Create dataset
-        dataset_folder = create_dataset(request.images, captions)
+        dataset_folder = await create_dataset(request.images, captions)
 
         # Update status to training
         with get_db() as conn:
@@ -508,7 +520,7 @@ async def run_training_job(job_id: str, request: TrainingRequest):
             sample_prompts_str = ",".join(request.sample_prompts)
 
         # Train model
-        folder_url = train_model(
+        folder_url = await train_model(
             dataset_folder=dataset_folder,
             lora_name=request.lora_name,
             concept_sentence=request.concept_sentence,
