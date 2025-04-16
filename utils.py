@@ -17,10 +17,6 @@ import asyncio
 from contextlib import nullcontext
 from io import BufferedWriter
 from s3_utils import get_s3_client
-import psutil
-import boto3
-import multiprocessing
-from huggingface_hub import whoami
 
 logger = logging.getLogger(__name__)
 
@@ -223,11 +219,11 @@ async def resolve_image_path(image_item):
         detail=f"Unsupported image type or format: {image_item}"
     )
 
-async def recursive_update(d, u):
+def recursive_update(d, u):
     """Recursively update nested dictionaries"""
     for k, v in u.items():
         if isinstance(v, dict) and v:
-            d[k] = await recursive_update(d.get(k, {}), v)
+            d[k] = recursive_update(d.get(k, {}), v)
         else:
             d[k] = v
     return d
@@ -242,8 +238,7 @@ def check_local_model_files(model_type="dev"):
         raise RuntimeError(f"Model files not found. Please ensure the model is downloaded to {model_path}")
     
     return model_path
-
-async def train_model(
+def train_model(
     dataset_folder,
     lora_name,
     concept_sentence=None,
@@ -255,25 +250,19 @@ async def train_model(
     sample_prompts=None,
     advanced_options=None
 ):
-    """Train the model with the given parameters"""
-    push_to_hub = True
-    try:
-        auth_info = whoami()
-        if not (auth_info["auth"]["accessToken"]["role"] == "write" or 
-                "repo.write" in auth_info["auth"]["accessToken"]["fineGrained"]["scoped"][0]["permissions"]):
-            push_to_hub = False
-    except:
-        push_to_hub = False
-
+    """Train the model and store exclusively in S3, returning a folder URL."""
     slugged_lora_name = slugify(lora_name)
-    
+    logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
+
     # Load default config
+    logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
     with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
         config = yaml.safe_load(f)
 
     # Update configuration
     config["config"]["name"] = slugged_lora_name
-    config["config"]["process"][0].update({
+    process_block = config["config"]["process"][0]
+    process_block.update({
         "model": {
             "low_vram": low_vram,
             "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
@@ -289,48 +278,105 @@ async def train_model(
             "linear_alpha": int(rank)
         },
         "datasets": [{"folder_path": dataset_folder}],
-        "save": {"push_to_hub": push_to_hub}
+        "save": {
+            "output_dir": f"tmp_models/{slugged_lora_name}",
+            "push_to_hub": False  # Disable Hugging Face push
+        }
     })
 
-    if push_to_hub:
-        username = whoami()["name"]
-        config["config"]["process"][0]["save"].update({
-            "hf_repo_id": f"{username}/{slugged_lora_name}",
-            "hf_private": True
-        })
-
     if concept_sentence:
-        config["config"]["process"][0]["trigger_word"] = concept_sentence
+        logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
+        process_block["trigger_word"] = concept_sentence
 
     if sample_prompts:
-        config["config"]["process"][0]["train"]["disable_sampling"] = False
-        config["config"]["process"][0]["sample"].update({
+        logger.debug("Sample prompts provided. Will enable sampling.")
+        process_block["train"]["disable_sampling"] = False
+        process_block["sample"].update({
             "sample_every": steps,
             "sample_steps": 28 if model_type == "dev" else 4,
             "prompts": sample_prompts
         })
     else:
-        config["config"]["process"][0]["train"]["disable_sampling"] = True
+        logger.debug("No sample prompts provided. Disabling sampling.")
+        process_block["train"]["disable_sampling"] = True
 
     if advanced_options:
-        config["config"]["process"][0] = await recursive_update(
-            config["config"]["process"][0], 
+        logger.debug("Merging advanced_options YAML into config.")
+        config["config"]["process"][0] = recursive_update(
+            config["config"]["process"][0],
             yaml.safe_load(advanced_options)
         )
 
     # Save config
-    config_path = f"tmp/{uuid.uuid4()}-{slugged_lora_name}.yaml"
-    os.makedirs("tmp", exist_ok=True)
+    config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
+    logger.debug("Saving updated config to: %s", config_path)
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w") as f:
         yaml.dump(config, f)
 
     # Run training
+    logger.info("Retrieving job with config path: %s", config_path)
     job = get_job(config_path)
-    job.run()
-    job.cleanup()
+    logger.debug("job object => %s", job)
+    if job is None:
+        raise RuntimeError(f"get_job() returned None for config path: {config_path}. Please check your job definition.")
 
-    # Return the model path/identifier
-    if push_to_hub:
-        return f"{username}/{slugged_lora_name}"
-    else:
-        return f"local_models/{slugged_lora_name}"
+    s3_folder_url = None # Initialize s3_folder_url outside try block
+
+    try: # Added try-except block around job.run() and job.cleanup()
+        job_start_time = time.time() # Timing start for job.run()
+        logger.info("Running job...")
+        job.run()
+        job_runtime = time.time() - job_start_time # Calculate job runtime
+        logger.info(f"Job run completed in {job_runtime:.2f} seconds.") # Log job runtime
+
+        cleanup_start_time = time.time() # Timing start for job.cleanup()
+        logger.info("Cleaning up job...")
+        job.cleanup()
+        cleanup_runtime = time.time() - cleanup_start_time # Calculate cleanup runtime
+        logger.info(f"Job cleanup completed in {cleanup_runtime:.2f} seconds.") # Log cleanup runtime
+
+
+        # Upload to S3
+        bucket_name = os.environ.get("S3_BUCKET")
+        s3_domain = os.getenv("S3_DOMAIN", "https://r2.syntx.ai")
+        local_model_dir = f"output/{slugged_lora_name}"
+
+
+        if bucket_name and os.path.exists(local_model_dir):
+            s3_prefix = f"loras/flux/{slugged_lora_name}"
+            logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
+            upload_start_time = time.time() # Timing start for S3 upload
+            logger.info("Starting S3 upload...")
+            if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
+                upload_runtime = time.time() - upload_start_time # Calculate upload runtime
+                logger.info(f"S3 upload completed in {upload_runtime:.2f} seconds.") # Log upload runtime
+
+                # Construct an HTTP-based “folder” URL on Timeweb S3
+                s3_endpoint = os.environ.get("S3_ENDPOINT", "https://s3.timeweb.cloud").rstrip("/")
+                s3_folder_url = f"{s3_domain}/{s3_prefix}/"
+                logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
+            else:
+                raise RuntimeError("upload_directory_to_s3 returned False indicating failure.") # Explicitly raise error if upload fails
+        else:
+            logger.warning("No S3_BUCKET set or local_model_dir does not exist. Skipping upload.")
+            raise RuntimeError("S3 bucket not configured or model directory missing, cannot complete training.") # Raise error as S3 URL is essential
+
+    except Exception as e_train_job: # Catch exceptions from job.run(), job.cleanup(), or S3 upload
+        logger.error(f"Error during training job execution in train_model: {e_train_job}", exc_info=True)
+        raise RuntimeError(f"Training job failed: {e_train_job}") from e_train_job # Re-raise to be caught by train_lora's except
+
+    finally: # Cleanup always, regardless of training success or failure, and *before* returning
+        # Cleanup
+        logger.debug("Removing dataset folder: %s", dataset_folder)
+        shutil.rmtree(dataset_folder, ignore_errors=True)
+        logger.debug("Removing config file: %s", config_path)
+        os.remove(config_path)
+
+
+    if not s3_folder_url: # Check again after the try-except-finally block, in case S3 upload failed inside try
+        msg = "Failed to obtain S3 folder URL after training, possibly due to upload failure or S3 configuration issues."
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    return s3_folder_url
