@@ -327,9 +327,17 @@ async def train_model(
     advanced_options=None
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
+    config_path = None
+    job = None
+    slugged_lora_name = slugify(lora_name)
+    local_model_dir = f"output/{slugged_lora_name}"
+
     try:
-        slugged_lora_name = slugify(lora_name)
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
+
+        # Create output directory structure
+        os.makedirs(local_model_dir, exist_ok=True)
+        logger.info("Created output directory: %s", local_model_dir)
 
         # Load default config
         logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
@@ -342,21 +350,21 @@ async def train_model(
         # Update configuration to be more memory-efficient
         config["config"]["process"][0].update({
             "model": {
-                "low_vram": True,  # Force low VRAM mode
+                "low_vram": True,
                 "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
                 "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None,
-                "gradient_checkpointing": True,  # Enable gradient checkpointing
-                "enable_xformers_memory_efficient_attention": True,  # Enable memory efficient attention
-                "model_cpu_offload": True,  # Enable CPU offloading
+                "gradient_checkpointing": True,
+                "enable_xformers_memory_efficient_attention": True,
+                "model_cpu_offload": True,
             },
             "train": {
                 "skip_first_sample": True,
                 "steps": int(steps),
                 "lr": float(lr),
-                "batch_size": 1,  # Minimum batch size
+                "batch_size": 1,
                 "gradient_accumulation_steps": 4,
-                "mixed_precision": "fp16",  # Use mixed precision training
-                "full_fp16": True,  # Use full fp16 training
+                "mixed_precision": "fp16",
+                "full_fp16": True,
             },
             "network": {
                 "linear": int(rank),
@@ -364,8 +372,8 @@ async def train_model(
             },
             "datasets": [{"folder_path": dataset_folder}],
             "save": {
-                "output_dir": f"tmp_models/{slugged_lora_name}",
-                "push_to_hub": False  # Disable Hugging Face push
+                "output_dir": local_model_dir,  # Use the created directory
+                "push_to_hub": False
             }
         })
 
@@ -410,14 +418,38 @@ async def train_model(
         try:
             job_start_time = time.time()
             logger.info("Running job...")
-            job.run()
+            
+            # Check if the job has the required methods
+            if not hasattr(job, 'run') or not callable(job.run):
+                raise RuntimeError("Job object does not have a valid run method")
+            
+            # Run the job and capture any potential exceptions
+            try:
+                job.run()
+            except Exception as e:
+                logger.exception("Error during job.run()")
+                raise RuntimeError(f"Training job failed: {str(e)}")
+            
             job_runtime = time.time() - job_start_time
             logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
+
+            # Verify the output directory contents after training
+            if os.path.exists(local_model_dir):
+                files = os.listdir(local_model_dir)
+                logger.info(f"Output directory contents: {files}")
+                if not files:
+                    raise RuntimeError(f"Output directory '{local_model_dir}' exists but is empty")
+            else:
+                raise RuntimeError(f"Output directory '{local_model_dir}' was not created during training")
+
         finally:
             # Ensure cleanup happens even if job.run() fails
             logger.info("Cleaning up job resources...")
             if hasattr(job, 'cleanup') and callable(job.cleanup):
-                job.cleanup()
+                try:
+                    job.cleanup()
+                except Exception as e:
+                    logger.error(f"Error during job cleanup: {e}")
             
             # Manually clean up any remaining references
             if hasattr(job, 'model'):
@@ -473,13 +505,20 @@ async def train_model(
 
     except Exception as e:
         logger.exception("Error during model training or upload")
+        # Log the state of the output directory
+        if os.path.exists(local_model_dir):
+            logger.error("Output directory exists but may be empty or invalid")
+            logger.error("Contents: %s", os.listdir(local_model_dir))
+        else:
+            logger.error("Output directory was never created")
+        
         clear_gpu_memory()
         raise
 
     finally:
         # Cleanup code
         try:
-            if os.path.exists(config_path):
+            if config_path and os.path.exists(config_path):
                 os.remove(config_path)
                 logger.debug("Removed config file: %s", config_path)
             if os.path.exists(dataset_folder):
