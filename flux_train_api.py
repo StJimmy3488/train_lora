@@ -17,6 +17,7 @@ from PIL import Image
 from dotenv import load_dotenv
 import requests  
 import torch
+from s3_utils import upload_directory_to_s3
 import boto3
 from botocore.exceptions import NoCredentialsError
 from slugify import slugify
@@ -73,47 +74,7 @@ def get_s3_client():
     )
 
 
-def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
-    """Uploads a directory to S3 while maintaining folder structure"""
-    logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
-                local_dir, bucket_name, s3_prefix)
-    
-    if not os.path.exists(local_dir):
-        logger.error("Local directory '%s' does not exist", local_dir)
-        return False
-        
-    try:
-        s3 = get_s3_client()
-        
-        # Count files first
-        total_files = sum([len(files) for _, _, files in os.walk(local_dir)])
-        logger.info("Found %d files to upload", total_files)
-        
-        uploaded_files = 0
-        for root, _, files in os.walk(local_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                relative_path = os.path.relpath(local_path, local_dir)
-                s3_key = f"{s3_prefix}/{relative_path}"
-                
-                try:
-                    logger.debug("Uploading file %d/%d: '%s' to '%s'",
-                               uploaded_files + 1, total_files, local_path, s3_key)
-                    s3.upload_file(local_path, bucket_name, s3_key)
-                    uploaded_files += 1
-                except Exception as e:
-                    logger.error("Failed to upload '%s': %s", local_path, e)
-                    return False
-                
-        logger.info("Successfully uploaded %d/%d files", uploaded_files, total_files)
-        return uploaded_files > 0  # Return True only if we uploaded at least one file
-        
-    except NoCredentialsError:
-        logger.error("AWS credentials not available")
-        return False
-    except Exception as e:
-        logger.exception("Error during S3 upload: %s", e)
-        return False
+
 
 
 async def resolve_image_path(image_item):
@@ -321,10 +282,6 @@ async def train_model(
     advanced_options=None
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
-    config_path = None
-    paths_to_cleanup = []
-    upload_success = False
-    
     try:
         slugged_lora_name = slugify(lora_name)
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
@@ -459,48 +416,32 @@ async def train_model(
             for file in files:
                 logger.info("  - %s", os.path.join(root, file))
 
-        # Upload to S3
         s3_prefix = f"loras/flux/{slugged_lora_name}"
         logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
         
-        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix)
-        
-        if upload_success:
+        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            paths_to_cleanup.extend([local_model_dir, dataset_folder, config_path])
             return s3_folder_url
         else:
             raise RuntimeError("Failed to upload model to S3")
 
     except Exception as e:
         logger.exception("Error during model training or upload")
-        # Log directory contents for debugging
-        for dir_path in [local_model_dir, dataset_folder]:
-            if os.path.exists(dir_path):
-                logger.error("Contents of %s: %s", dir_path, os.listdir(dir_path))
         clear_gpu_memory()
         raise
 
     finally:
-        # Only cleanup if upload was successful
-        if upload_success:
-            for path in paths_to_cleanup:
-                try:
-                    if os.path.exists(path):
-                        if os.path.isfile(path):
-                            os.remove(path)
-                            logger.debug("Removed temporary file: %s", path)
-                        else:
-                            shutil.rmtree(path, ignore_errors=True)
-                            logger.debug("Removed temporary directory: %s", path)
-                except Exception as e:
-                    logger.error("Error cleaning up %s: %s", path, e)
-        else:
-            logger.warning("Upload was not successful, preserving files for debugging:")
-            for dir_path in [local_model_dir, dataset_folder]:
-                if os.path.exists(dir_path):
-                    logger.warning("- %s", dir_path)
+        # Cleanup code
+        try:
+            if os.path.exists(config_path):
+                os.remove(config_path)
+                logger.debug("Removed config file: %s", config_path)
+            if os.path.exists(dataset_folder):
+                shutil.rmtree(dataset_folder, ignore_errors=True)
+                logger.debug("Removed dataset folder: %s", dataset_folder)
+        except Exception as e:
+            logger.error("Error during cleanup: %s", e)
         
         clear_gpu_memory()
 
