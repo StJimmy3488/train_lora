@@ -282,9 +282,6 @@ async def train_model(
     advanced_options=None
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
-    config_path = None
-    upload_success = False
-    
     try:
         slugged_lora_name = slugify(lora_name)
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
@@ -417,58 +414,32 @@ async def train_model(
         logger.info("Contents of model directory before upload:")
         for root, dirs, files in os.walk(local_model_dir):
             for file in files:
-                file_path = os.path.join(root, file)
-                file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-                logger.info("  - %s (%.2f MB)", file_path, file_size)
+                logger.info("  - %s", os.path.join(root, file))
 
         s3_prefix = f"loras/flux/{slugged_lora_name}"
         logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
         
-        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix)
-        
-        if upload_success:
+        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
             return s3_folder_url
         else:
-            logger.error("S3 upload failed. Preserving local files for debugging.")
-            logger.error("Model files remain in: %s", local_model_dir)
-            logger.error("Dataset files remain in: %s", dataset_folder)
             raise RuntimeError("Failed to upload model to S3")
 
     except Exception as e:
         logger.exception("Error during model training or upload")
-        # Log final directory state for debugging
-        for dir_path in [local_model_dir, dataset_folder]:
-            if os.path.exists(dir_path):
-                logger.error("Contents of %s:", dir_path)
-                for root, dirs, files in os.walk(dir_path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-                        logger.error("  - %s (%.2f MB)", file_path, file_size)
         clear_gpu_memory()
         raise
 
     finally:
-        # Only cleanup config file and GPU memory, preserve model and dataset files if upload failed
+        # Cleanup code
         try:
-            if config_path and os.path.exists(config_path):
+            if os.path.exists(config_path):
                 os.remove(config_path)
                 logger.debug("Removed config file: %s", config_path)
-            
-            # Only cleanup model and dataset files if upload was successful
-            if upload_success:
-                if os.path.exists(local_model_dir):
-                    shutil.rmtree(local_model_dir, ignore_errors=True)
-                    logger.debug("Removed model directory: %s", local_model_dir)
-                if os.path.exists(dataset_folder):
-                    shutil.rmtree(dataset_folder, ignore_errors=True)
-                    logger.debug("Removed dataset folder: %s", dataset_folder)
-            else:
-                logger.warning("Upload failed - preserving files for debugging:")
-                logger.warning("  Model directory: %s", local_model_dir)
-                logger.warning("  Dataset directory: %s", dataset_folder)
+            if os.path.exists(dataset_folder):
+                shutil.rmtree(dataset_folder, ignore_errors=True)
+                logger.debug("Removed dataset folder: %s", dataset_folder)
         except Exception as e:
             logger.error("Error during cleanup: %s", e)
         
