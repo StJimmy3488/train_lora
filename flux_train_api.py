@@ -621,17 +621,30 @@ def run_training_in_subprocess(request_dict, job_id):
             bufsize=1  # Line buffered
         )
         
-        # Create separate threads to continuously read stdout and stderr
-        def log_output(pipe, level):
+        # Use a queue to capture the final result
+        import queue
+        result_queue = queue.Queue()
+        
+        def log_output(pipe, level, is_stdout=False):
+            final_output = []
             for line in iter(pipe.readline, ''):
                 if level == logging.INFO:
-                    logger.info(f"Subprocess: {line.strip()}")
+                    if line.startswith('{"status":'):
+                        # This is our JSON result
+                        result_queue.put(line.strip())
+                    else:
+                        logger.info(f"Subprocess: {line.strip()}")
+                        if is_stdout:
+                            final_output.append(line.strip())
                 else:
                     logger.error(f"Subprocess error: {line.strip()}")
+            if is_stdout and not result_queue.qsize():
+                # If no JSON result was found, store the full output
+                result_queue.put('\n'.join(final_output))
         
         import threading
-        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, logging.INFO))
-        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, logging.ERROR))
+        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, logging.INFO, True))
+        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, logging.ERROR, False))
         stdout_thread.daemon = True
         stderr_thread.daemon = True
         stdout_thread.start()
@@ -643,24 +656,29 @@ def run_training_in_subprocess(request_dict, job_id):
         
         # Wait for process to complete
         returncode = process.wait(timeout=7200)
-        stdout_thread.join()
-        stderr_thread.join()
+        stdout_thread.join(timeout=5)  # Add timeout to thread joining
+        stderr_thread.join(timeout=5)
         
         if returncode != 0:
             logger.error(f"Subprocess failed with return code {returncode}")
             return {"status": "error", "message": "Training process failed"}
         
-        # Get the final output
-        final_output = process.stdout.read()
-        logger.info("Subprocess completed successfully")
-        
         try:
-            result = json.loads(final_output)
-            logger.info(f"Training result: {result}")
-            return result
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse subprocess output: {e}\nOutput was: {final_output}")
-            return {"status": "error", "message": f"Failed to parse training result: {e}"}
+            # Get the result from the queue
+            final_output = result_queue.get(timeout=5)
+            logger.debug(f"Raw subprocess output: {final_output}")
+            
+            try:
+                result = json.loads(final_output)
+                logger.info(f"Training result: {result}")
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse subprocess output: {e}\nOutput was: {final_output}")
+                return {"status": "error", "message": "Training process output was not in the expected format"}
+                
+        except queue.Empty:
+            logger.error("No output received from subprocess")
+            return {"status": "error", "message": "No output received from training process"}
             
     except subprocess.TimeoutExpired:
         logger.error("Training subprocess timed out after 2 hours")
