@@ -10,8 +10,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('subprocess_training.log')
+        logging.StreamHandler(sys.stderr),  # Log everything except the result to stderr
     ]
 )
 logger = logging.getLogger(__name__)
@@ -42,9 +41,8 @@ def main():
         result = asyncio.run(train_lora(**request_dict))
         logger.info(f"Training completed with result: {result}")
 
-        # Output result
-        print(json.dumps(result))
-        sys.stdout.flush()
+        # Output result to stdout
+        print(json.dumps(result), flush=True)
 
     except Exception as e:
         import traceback
@@ -54,7 +52,8 @@ def main():
             "traceback": traceback.format_exc()
         }
         logger.error(f"Training failed: {error_info}")
-        print(json.dumps(error_info), file=sys.stderr)
+        # Make sure to output JSON to stdout even in case of error
+        print(json.dumps(error_info), flush=True)
         sys.exit(1)
 
     finally:
