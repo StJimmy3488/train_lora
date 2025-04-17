@@ -460,7 +460,7 @@ async def train_lora(
         dataset_folder = await create_dataset(images, captions)
 
         logger.info("3. Train the model using train_model function.")
-        folder_url = await train_model(
+        folder_url = train_model(
             dataset_folder,
             lora_name,
             concept_sentence,
