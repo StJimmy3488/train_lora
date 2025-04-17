@@ -6,8 +6,6 @@ import json
 import yaml
 import logging
 import time 
-import threading
-import queue
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -25,7 +23,6 @@ from slugify import slugify
 
 from transformers import AutoProcessor, AutoModelForCausalLM
 from botocore.config import Config
-from s3_utils import upload_directory_to_s3
 
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "ai-toolkit")
@@ -76,88 +73,47 @@ def get_s3_client():
     )
 
 
-# def upload_directory_to_s3(local_dir, bucket_name, s3_prefix, cleanup=True):
-#     """Uploads a directory to S3 while maintaining folder structure"""
-#     logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
-#                 local_dir, bucket_name, s3_prefix)
+def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
+    """Uploads a directory to S3 while maintaining folder structure"""
+    logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
+                local_dir, bucket_name, s3_prefix)
     
-#     if not os.path.exists(local_dir):
-#         logger.error("Local directory '%s' does not exist", local_dir)
-#         return False
+    if not os.path.exists(local_dir):
+        logger.error("Local directory '%s' does not exist", local_dir)
+        return False
         
-#     try:
-#         # Verify directory has files before attempting upload
-#         total_files = 0
-#         file_list = []
-#         for root, _, files in os.walk(local_dir):
-#             for file in files:
-#                 full_path = os.path.join(root, file)
-#                 if os.path.getsize(full_path) > 0:  # Only count non-empty files
-#                     total_files += 1
-#                     file_list.append(full_path)
-#                     logger.debug("Found file: %s (%.2f MB)", 
-#                                full_path, os.path.getsize(full_path)/1024/1024)
+    try:
+        s3 = get_s3_client()
         
-#         if total_files == 0:
-#             logger.error("No valid files found in directory '%s' to upload", local_dir)
-#             return False
-            
-#         logger.info("Found %d files to upload", total_files)
+        # Count files first
+        total_files = sum([len(files) for _, _, files in os.walk(local_dir)])
+        logger.info("Found %d files to upload", total_files)
         
-#         s3 = get_s3_client()
-#         uploaded_files = 0
-        
-#         for local_path in file_list:
-#             try:
-#                 relative_path = os.path.relpath(local_path, local_dir)
-#                 s3_key = f"{s3_prefix}/{relative_path}"
+        uploaded_files = 0
+        for root, _, files in os.walk(local_dir):
+            for file in files:
+                local_path = os.path.join(root, file)
+                relative_path = os.path.relpath(local_path, local_dir)
+                s3_key = f"{s3_prefix}/{relative_path}"
                 
-#                 # Verify file still exists and is readable
-#                 if not os.path.exists(local_path):
-#                     logger.error("File disappeared during upload: %s", local_path)
-#                     continue
-                    
-#                 if not os.access(local_path, os.R_OK):
-#                     logger.error("File not readable: %s", local_path)
-#                     continue
+                try:
+                    logger.debug("Uploading file %d/%d: '%s' to '%s'",
+                               uploaded_files + 1, total_files, local_path, s3_key)
+                    s3.upload_file(local_path, bucket_name, s3_key)
+                    uploaded_files += 1
+                except Exception as e:
+                    logger.error("Failed to upload '%s': %s", local_path, e)
+                    return False
                 
-#                 logger.debug("Uploading file %d/%d: '%s' to '%s'",
-#                            uploaded_files + 1, total_files, local_path, s3_key)
-#                 s3.upload_file(local_path, bucket_name, s3_key)
-#                 uploaded_files += 1
-                
-#                 # Verify upload
-#                 try:
-#                     s3.head_object(Bucket=bucket_name, Key=s3_key)
-#                     logger.debug("Verified upload of: %s", s3_key)
-#                 except Exception as e:
-#                     logger.error("Failed to verify upload of '%s': %s", s3_key, e)
-#                     return False
-                    
-#             except Exception as e:
-#                 logger.error("Failed to upload '%s': %s", local_path, e)
-#                 return False
-                
-#         logger.info("Successfully uploaded %d/%d files", uploaded_files, total_files)
-#         success = uploaded_files == total_files
+        logger.info("Successfully uploaded %d/%d files", uploaded_files, total_files)
+        return uploaded_files > 0  # Return True only if we uploaded at least one file
         
-#         if cleanup and success:
-#             try:
-#                 logger.debug("Upload successful, cleaning up local directory '%s'", local_dir)
-#                 shutil.rmtree(local_dir, ignore_errors=True)
-#             except Exception as e:
-#                 logger.error("Error cleaning up local directory: %s", e)
-#         elif not success:
-#             logger.warning("Upload incomplete, keeping local directory: %s", local_dir)
-            
-#         return success
-        
-#     except NoCredentialsError:
-#         logger.error("AWS credentials not available")
-#         return False
-#     except Exception as e:
-#         logger.exception("Error during S3 upload: %s", e)
-#         return False
+    except NoCredentialsError:
+        logger.error("AWS credentials not available")
+        return False
+    except Exception as e:
+        logger.exception("Error during S3 upload: %s", e)
+        return False
 
 
 async def resolve_image_path(image_item):
@@ -294,14 +250,14 @@ def process_images_and_captions(images, concept_sentence=None):
                 raise
 
     finally:
-        # # Cleanup downloaded images
-        # for path in local_image_paths:
-        #     try:
-        #         if os.path.exists(path):
-        #             os.remove(path)
-        #             logger.debug(f"Removed temporary image file: {path}")
-        #     except Exception as e:
-        #         logger.error(f"Error removing temporary file {path}: {e}")
+        # Cleanup downloaded images
+        for path in local_image_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    logger.debug(f"Removed temporary image file: {path}")
+            except Exception as e:
+                logger.error(f"Error removing temporary file {path}: {e}")
 
         # Aggressive GPU memory cleanup
         if torch.cuda.is_available():
@@ -366,30 +322,13 @@ async def train_model(
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
     config_path = None
-    cleanup_paths = []
-    success = False  # Add flag to track successful completion
+    paths_to_cleanup = []
+    upload_success = False
     
     try:
         slugged_lora_name = slugify(lora_name)
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
 
-        # Create output directories
-        output_dir = f"output/{slugged_lora_name}"
-        local_model_dir = f"tmp_models/{slugged_lora_name}"
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(local_model_dir, exist_ok=True)
-
-        # Log initial directory state
-        logger.info("Initial output directory state:")
-        if os.path.exists(output_dir):
-            logger.info("Contents of %s: %s", output_dir, os.listdir(output_dir))
-        else:
-            logger.info("Output directory does not exist yet")
-
-        # Save config
-        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
-        cleanup_paths.append(config_path)  # Add to cleanup list
-        
         # Load default config
         logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
         with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
@@ -398,7 +337,7 @@ async def train_model(
         # Clear memory before starting
         clear_gpu_memory()
         
-        # Update configuration with consistent output path
+        # Update configuration to be more memory-efficient
         config["config"]["process"][0].update({
             "model": {
                 "low_vram": True,  # Force low VRAM mode
@@ -423,8 +362,8 @@ async def train_model(
             },
             "datasets": [{"folder_path": dataset_folder}],
             "save": {
-                "output_dir": output_dir,  # Use the same output_dir consistently
-                "push_to_hub": False
+                "output_dir": f"tmp_models/{slugged_lora_name}",
+                "push_to_hub": False  # Disable Hugging Face push
             }
         })
 
@@ -452,6 +391,7 @@ async def train_model(
             )
 
         # Save config
+        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
         logger.debug("Saving updated config to: %s", config_path)
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w") as f:
@@ -461,96 +401,33 @@ async def train_model(
         logger.info("Retrieving job with config path: %s", config_path)
         job = get_job(config_path, slugged_lora_name)
 
+        logger.debug("job object => %s", job)
         if job is None:
             raise RuntimeError(f"get_job() returned None for config path: {config_path}.")
 
         try:
             job_start_time = time.time()
             logger.info("Running job...")
-            
-            # Start a monitoring thread to check output directory
-            def monitor_output():
-                while True:
-                    time.sleep(30)  # Check every 30 seconds
-                    if os.path.exists(output_dir):
-                        files = os.listdir(output_dir)
-                        logger.info("Current output directory contents: %s", files)
-                    else:
-                        logger.info("Output directory still does not exist")
-
-            monitor_thread = threading.Thread(target=monitor_output, daemon=True)
-            monitor_thread.start()
-
-            # Run the job
             job.run()
             job_runtime = time.time() - job_start_time
             logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
-
-            # Check output directory immediately after job completion
-            logger.info("Checking output directory after job completion:")
-            if os.path.exists(output_dir):
-                files = os.listdir(output_dir)
-                logger.info("Files in output directory: %s", files)
-                for file in files:
-                    full_path = os.path.join(output_dir, file)
-                    if os.path.isfile(full_path):
-                        size = os.path.getsize(full_path)
-                        logger.info("File %s size: %.2f MB", file, size/1024/1024)
-            else:
-                logger.error("Output directory does not exist after job completion")
-                raise RuntimeError("Training job did not create output directory")
-
         finally:
-            # Cleanup job resources
+            # Ensure cleanup happens even if job.run() fails
             logger.info("Cleaning up job resources...")
             if hasattr(job, 'cleanup') and callable(job.cleanup):
                 job.cleanup()
             
+            # Manually clean up any remaining references
             if hasattr(job, 'model'):
                 if hasattr(job.model, 'to'):
                     job.model.to('cpu')
                 del job.model
             
+            # Force garbage collection
             clear_gpu_memory()
+            
+            # Clear the job reference
             del job
-
-        # Wait a moment for any file operations to complete
-        time.sleep(2)
-
-        # After training, check and move files
-        if os.path.exists(output_dir):
-            logger.info("Moving files from %s to %s", output_dir, local_model_dir)
-            output_files = os.listdir(output_dir)
-            if not output_files:
-                logger.error("Output directory exists but is empty after training")
-                raise RuntimeError(f"No files were created in {output_dir} during training")
-
-            for item in output_files:
-                src = os.path.join(output_dir, item)
-                dst = os.path.join(local_model_dir, item)
-                try:
-                    if os.path.isfile(src):
-                        shutil.move(src, dst)
-                        logger.info("Moved file: %s -> %s (%.2f MB)", 
-                                  item, dst, os.path.getsize(dst)/1024/1024)
-                    elif os.path.isdir(src):
-                        shutil.move(src, dst)
-                        logger.info("Moved directory: %s -> %s", item, dst)
-                except Exception as e:
-                    logger.error("Error moving %s to %s: %s", src, dst, e)
-                    raise RuntimeError(f"Failed to move training output: {str(e)}")
-
-        # Verify files exist before upload
-        if not os.path.exists(local_model_dir):
-            logger.error("Model directory does not exist after file move")
-            raise RuntimeError(f"Model directory {local_model_dir} does not exist")
-
-        model_files = os.listdir(local_model_dir)
-        if not model_files:
-            logger.error("Model directory is empty after file move")
-            raise RuntimeError(f"No files found in {local_model_dir} after training")
-
-        logger.info("Files ready for upload: %s", model_files)
 
         # Check S3 configuration early
         bucket_name = os.environ.get("S3_BUCKET")
@@ -561,17 +438,37 @@ async def train_model(
         if not s3_domain:
             raise RuntimeError("S3_DOMAIN environment variable is not set")
 
+        # After training, verify output directory
+        local_model_dir = f"output/{slugged_lora_name}"
+        logger.info("Checking for model output directory: %s", local_model_dir)
+        
+        if not os.path.exists(local_model_dir):
+            # Log directory contents to help debug
+            output_dir = "output"
+            if os.path.exists(output_dir):
+                logger.error("Contents of output directory:")
+                for item in os.listdir(output_dir):
+                    logger.error("  - %s", item)
+            else:
+                logger.error("Output directory does not exist")
+            raise RuntimeError(f"Model output directory '{local_model_dir}' was not created during training")
+
+        # Log directory contents before upload
+        logger.info("Contents of model directory before upload:")
+        for root, dirs, files in os.walk(local_model_dir):
+            for file in files:
+                logger.info("  - %s", os.path.join(root, file))
+
         # Upload to S3
         s3_prefix = f"loras/flux/{slugged_lora_name}"
         logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
         
-        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix, cleanup=False)
+        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix)
         
         if upload_success:
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            success = True  # Mark as successful only after upload
-            cleanup_paths.extend([local_model_dir, dataset_folder])
+            paths_to_cleanup.extend([local_model_dir, dataset_folder, config_path])
             return s3_folder_url
         else:
             raise RuntimeError("Failed to upload model to S3")
@@ -579,18 +476,16 @@ async def train_model(
     except Exception as e:
         logger.exception("Error during model training or upload")
         # Log directory contents for debugging
-        for dir_path in [output_dir, local_model_dir]:
+        for dir_path in [local_model_dir, dataset_folder]:
             if os.path.exists(dir_path):
                 logger.error("Contents of %s: %s", dir_path, os.listdir(dir_path))
-            else:
-                logger.error("Directory does not exist: %s", dir_path)
         clear_gpu_memory()
         raise
 
     finally:
-        # Only cleanup if training and upload were successful
-        if success:
-            for path in cleanup_paths:
+        # Only cleanup if upload was successful
+        if upload_success:
+            for path in paths_to_cleanup:
                 try:
                     if os.path.exists(path):
                         if os.path.isfile(path):
@@ -602,8 +497,10 @@ async def train_model(
                 except Exception as e:
                     logger.error("Error cleaning up %s: %s", path, e)
         else:
-            logger.warning("Training/upload failed, preserving temporary files for debugging")
-            logger.warning("Temporary files remain in: %s and %s", local_model_dir, dataset_folder)
+            logger.warning("Upload was not successful, preserving files for debugging:")
+            for dir_path in [local_model_dir, dataset_folder]:
+                if os.path.exists(dir_path):
+                    logger.warning("- %s", dir_path)
         
         clear_gpu_memory()
 
@@ -724,6 +621,8 @@ def run_training_in_subprocess(request_dict, job_id):
         
         logger.debug("Subprocess environment configuration:")
         env = get_subprocess_env()
+        for key in ['PYTORCH_CUDA_ALLOC_CONF', 'CUDA_VISIBLE_DEVICES']:
+            logger.debug(f"  {key}: {env.get(key, 'not set')}")
         
         logger.info("Launching subprocess with train_subprocess.py")
         process = subprocess.Popen(
@@ -733,69 +632,33 @@ def run_training_in_subprocess(request_dict, job_id):
             stderr=subprocess.PIPE,
             env=env,
             text=True,
-            bufsize=1
+            bufsize=1  # Line buffered
         )
         
+        # Use a queue to capture the final result
         import queue
         result_queue = queue.Queue()
         
-        def parse_log_level(line):
-            """Parse log level from line and strip timestamp"""
-            line = line.strip()
-            if not line:
-                return None, None
-                
-            # Try to extract log level from standard format
-            level_markers = {
-                '[DEBUG]': logging.DEBUG,
-                '[INFO]': logging.INFO,
-                '[WARNING]': logging.WARNING,
-                '[ERROR]': logging.ERROR,
-                '[CRITICAL]': logging.CRITICAL
-            }
-            
-            for marker, level in level_markers.items():
-                if marker in line:
-                    # Remove timestamp and level from message
-                    parts = line.split(marker, 1)
-                    if len(parts) == 2:
-                        return level, parts[1].strip()
-            
-            return None, line
-
-        def log_output(pipe, is_stderr=False):
-            """Parse and log output with appropriate levels"""
+        def log_output(pipe, level, is_stdout=False):
             final_output = []
             for line in iter(pipe.readline, ''):
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Check for JSON result first
-                if line.startswith('{"status":'):
-                    result_queue.put(line)
-                    continue
-                
-                # Parse log level and message
-                level, message = parse_log_level(line)
-                
-                if level is None:
-                    # If no level found, use default levels
-                    if is_stderr and any(err in line.lower() for err in ['error:', 'exception:', 'traceback:']):
-                        level = logging.ERROR
+                if level == logging.INFO:
+                    if line.startswith('{"status":'):
+                        # This is our JSON result
+                        result_queue.put(line.strip())
                     else:
-                        level = logging.INFO
-                    message = line
-                
-                logger.log(level, "Subprocess: %s", message)
-                if not is_stderr:
-                    final_output.append(line)
-            
-            if not is_stderr and not result_queue.qsize():
+                        logger.info(f"Subprocess: {line.strip()}")
+                        if is_stdout:
+                            final_output.append(line.strip())
+                else:
+                    logger.error(f"Subprocess error: {line.strip()}")
+            if is_stdout and not result_queue.qsize():
+                # If no JSON result was found, store the full output
                 result_queue.put('\n'.join(final_output))
         
-        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, False))
-        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, True))
+        import threading
+        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, logging.INFO, True))
+        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, logging.ERROR, False))
         stdout_thread.daemon = True
         stderr_thread.daemon = True
         stdout_thread.start()
@@ -859,22 +722,19 @@ def run_training_job(job_id: str, request: TrainingRequest):
         result = run_training_in_subprocess(request_dict, job_id)
 
         if result["status"] == "success":
-            # --- Solution A: Explicitly delete model & dataset folders here, after a successful upload ---
-            from slugify import slugify
-            slug = slugify(request.lora_name)
-            # This must match whatever you set as training_folder/output_dir in train_model
-            model_dir = f"output/{slug}"
-            dataset_dir = f"tmp_datasets/{slug}"  # if you used slug for your tmp_datasets too
-            import shutil, os
-            for d in (dataset_dir, model_dir):
-                if os.path.exists(d):
-                    shutil.rmtree(d, ignore_errors=True)
-                    logger.debug("Cleaned up directory after successful run: %s", d)
-            # Now mark the job completed in the DB
+            # Update final status
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
                     ("completed", 1.0, result["folder_url"], job_id)
+                )
+                conn.commit()
+        else:
+            # Update error status
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
+                    ("failed", result["message"], job_id)
                 )
                 conn.commit()
 
