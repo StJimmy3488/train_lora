@@ -10,7 +10,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stderr),  # Log everything except the result to stderr
+        logging.StreamHandler(sys.stdout),  # Log everything except the result to stderr
     ]
 )
 logger = logging.getLogger(__name__)
