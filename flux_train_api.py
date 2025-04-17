@@ -294,14 +294,14 @@ def process_images_and_captions(images, concept_sentence=None):
                 raise
 
     finally:
-        # Cleanup downloaded images
-        for path in local_image_paths:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-                    logger.debug(f"Removed temporary image file: {path}")
-            except Exception as e:
-                logger.error(f"Error removing temporary file {path}: {e}")
+        # # Cleanup downloaded images
+        # for path in local_image_paths:
+        #     try:
+        #         if os.path.exists(path):
+        #             os.remove(path)
+        #             logger.debug(f"Removed temporary image file: {path}")
+        #     except Exception as e:
+        #         logger.error(f"Error removing temporary file {path}: {e}")
 
         # Aggressive GPU memory cleanup
         if torch.cuda.is_available():
