@@ -365,15 +365,22 @@ async def train_model(
     advanced_options=None
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
+    config_path = None  # Define outside try block so finally can access it
+    cleanup_paths = []  # Track paths that need cleanup
+    
     try:
         slugged_lora_name = slugify(lora_name)
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
 
-        # Create output directory early
+        # Create output directories
         output_dir = f"output/{slugged_lora_name}"
         local_model_dir = f"tmp_models/{slugged_lora_name}"
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(local_model_dir, exist_ok=True)
+
+        # Save config
+        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
+        cleanup_paths.append(config_path)  # Add to cleanup list
         
         # Load default config
         logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
@@ -437,7 +444,6 @@ async def train_model(
             )
 
         # Save config
-        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
         logger.debug("Saving updated config to: %s", config_path)
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w") as f:
@@ -484,50 +490,38 @@ async def train_model(
         if not s3_domain:
             raise RuntimeError("S3_DOMAIN environment variable is not set")
 
-        # After training, move files from output_dir to local_model_dir
+        # After training, check and move files
         if os.path.exists(output_dir):
             logger.info("Moving files from %s to %s", output_dir, local_model_dir)
-            for item in os.listdir(output_dir):
-                src = os.path.join(output_dir, item)
-                dst = os.path.join(local_model_dir, item)
-                if os.path.isfile(src):
-                    shutil.copy2(src, dst)
-                    logger.debug("Copied %s to %s", src, dst)
-                elif os.path.isdir(src):
-                    shutil.copytree(src, dst, dirs_exist_ok=True)
-                    logger.debug("Copied directory %s to %s", src, dst)
-
-        # Verify files were copied
-        if not os.path.exists(local_model_dir) or not os.listdir(local_model_dir):
-            raise RuntimeError(f"No files were copied to {local_model_dir}")
-
-        # After training, verify output directory
-        local_model_dir = f"tmp_models/{slugged_lora_name}"
-        logger.info("Checking for model output directory: %s", local_model_dir)
-        
-        if not os.path.exists(local_model_dir):
-            # Log directory contents to help debug
-            output_dir = "output"
-            if os.path.exists(output_dir):
-                logger.error("Contents of output directory:")
+            try:
+                # Move files instead of copying
                 for item in os.listdir(output_dir):
-                    logger.error("  - %s", item)
-            else:
-                logger.error("Output directory does not exist")
-            raise RuntimeError(f"Model output directory '{local_model_dir}' was not created during training")
+                    src = os.path.join(output_dir, item)
+                    dst = os.path.join(local_model_dir, item)
+                    if os.path.isfile(src):
+                        shutil.move(src, dst)
+                        logger.debug("Moved file: %s -> %s", src, dst)
+                    elif os.path.isdir(src):
+                        shutil.move(src, dst)
+                        logger.debug("Moved directory: %s -> %s", src, dst)
+            except Exception as e:
+                logger.error("Error moving files: %s", e)
+                raise RuntimeError(f"Failed to move training output: {str(e)}")
 
-        # Log directory contents before upload
-        logger.info("Contents of model directory before upload:")
-        for root, dirs, files in os.walk(local_model_dir):
-            for file in files:
-                logger.info("  - %s", os.path.join(root, file))
+        # Verify files exist before upload
+        if not os.path.exists(local_model_dir) or not os.listdir(local_model_dir):
+            raise RuntimeError(f"No files found in {local_model_dir} after training")
 
+        # Upload to S3
         s3_prefix = f"loras/flux/{slugged_lora_name}"
         logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
         
-        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
+        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix, cleanup=False)  # Don't cleanup in upload
+        
+        if upload_success:
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
+            cleanup_paths.append(local_model_dir)  # Only add to cleanup after successful upload
             return s3_folder_url
         else:
             raise RuntimeError("Failed to upload model to S3")
@@ -538,16 +532,26 @@ async def train_model(
         raise
 
     finally:
-        # Cleanup code
-        try:
-            if os.path.exists(config_path):
-                os.remove(config_path)
-                logger.debug("Removed config file: %s", config_path)
-            if os.path.exists(dataset_folder):
+        # Cleanup only specified paths
+        for path in cleanup_paths:
+            try:
+                if os.path.exists(path):
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        logger.debug("Removed file: %s", path)
+                    else:
+                        shutil.rmtree(path, ignore_errors=True)
+                        logger.debug("Removed directory: %s", path)
+            except Exception as e:
+                logger.error("Error cleaning up %s: %s", path, e)
+
+        # Always clean up dataset folder
+        if os.path.exists(dataset_folder):
+            try:
                 shutil.rmtree(dataset_folder, ignore_errors=True)
                 logger.debug("Removed dataset folder: %s", dataset_folder)
-        except Exception as e:
-            logger.error("Error during cleanup: %s", e)
+            except Exception as e:
+                logger.error("Error cleaning up dataset folder: %s", e)
         
         clear_gpu_memory()
 
