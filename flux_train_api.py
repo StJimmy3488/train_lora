@@ -40,7 +40,7 @@ logging.basicConfig(
 import boto3
 from botocore.config import Config
 import os
-from asyncio import create_task
+import gc
 
 def get_s3_client():
     """Create S3-compatible client for Cloudflare R2"""
@@ -150,11 +150,16 @@ def process_images_and_captions(images, concept_sentence=None):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16
+    model = None
+    processor = None
+    captions = []
+    local_image_paths = []
 
     try:
-        # Clear CUDA cache before loading model
+        # Clear CUDA cache before starting
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
             
         model = AutoModelForCausalLM.from_pretrained(
             "multimodalart/Florence-2-large-no-flash-attn",
@@ -166,9 +171,6 @@ def process_images_and_captions(images, concept_sentence=None):
             "multimodalart/Florence-2-large-no-flash-attn",
             trust_remote_code=True
         )
-
-        captions = []
-        local_image_paths = []
 
         # Resolve URLs to local paths synchronously
         for image_item in images:
@@ -225,13 +227,16 @@ def process_images_and_captions(images, concept_sentence=None):
             if os.path.exists(path):
                 os.remove(path)
 
-        # Proper GPU memory cleanup
+        # Aggressive GPU memory cleanup
         if torch.cuda.is_available():
-            model.to('cpu')
-            del model
-            del processor
+            if model is not None:
+                model.cpu()
+                del model
+            if processor is not None:
+                del processor
             torch.cuda.empty_cache()
-            
+            gc.collect()
+
     logger.debug("Generated %d captions", len(captions))
     if len(captions) == 0:
         raise RuntimeError("No captions were generated from the images")
@@ -349,10 +354,11 @@ async def train_model(
     with open(config_path, "w") as f:
         yaml.dump(config, f)
 
-    # Clear CUDA cache before starting training
+    # Clear CUDA cache at the start
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        
+        torch.cuda.reset_peak_memory_stats()
+
     # Run training
     logger.info("Retrieving job with config path: %s", config_path)
     job = get_job(config_path, slugged_lora_name)
@@ -376,6 +382,10 @@ async def train_model(
         cleanup_runtime = time.time() - cleanup_start_time # Calculate cleanup runtime
         logger.info(f"Job cleanup completed in {cleanup_runtime:.2f} seconds.") # Log cleanup runtime
 
+        # Ensure cleanup happens even if job.run() fails
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
         # Upload to S3
         bucket_name = os.environ.get("S3_BUCKET")
@@ -407,7 +417,12 @@ async def train_model(
         raise RuntimeError(f"Training job failed: {e_train_job}") from e_train_job # Re-raise to be caught by train_lora's except
 
     finally: # Cleanup always, regardless of training success or failure, and *before* returning
-        # Cleanup
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Existing cleanup code
         logger.debug("Removing dataset folder: %s", dataset_folder)
         shutil.rmtree(dataset_folder, ignore_errors=True)
         logger.debug("Removing config file: %s", config_path)
@@ -483,10 +498,16 @@ async def train_lora(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Add CUDA memory management environment variable
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # Startup
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.8)
     init_db()
     yield
+    # Shutdown
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
 
 app = FastAPI(title="FLUX LoRA Trainer API", lifespan=lifespan)
 
@@ -522,6 +543,11 @@ class JobStatus(BaseModel):
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
     try:
+        # Clear CUDA cache at the start of each job
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
         # Update job status to processing
         with get_db() as conn:
             conn.execute(
@@ -530,7 +556,7 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
 
-        # Run the actual training - use asyncio.run to handle the async train_lora
+        # Run the actual training using asyncio.run
         import asyncio
         result = asyncio.run(train_lora(
             images=request.images,
@@ -570,6 +596,11 @@ def run_training_job(job_id: str, request: TrainingRequest):
                 ("failed", str(e), job_id)
             )
             conn.commit()
+    finally:
+        # Ensure CUDA cache is cleared after job completion
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
@@ -597,7 +628,7 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
         )
         conn.commit()
 
-    # Use background_tasks instead of create_task
+    # Add the task to background tasks
     background_tasks.add_task(run_training_job, job_id, request)
 
     return TrainingResponse(
@@ -700,6 +731,15 @@ def init_db():
             )
         """)
         conn.commit()
+
+@contextmanager
+def device_context(device="cuda"):
+    try:
+        yield device
+    finally:
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
 if __name__ == "__main__":
     import uvicorn
