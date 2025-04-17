@@ -569,7 +569,10 @@ async def train_model(
         if upload_success:
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            cleanup_paths.append(local_model_dir)  # Only add to cleanup after successful upload
+            
+            # Only cleanup after successful upload
+            logger.debug("Upload successful, cleaning up temporary files")
+            cleanup_paths.extend([local_model_dir, dataset_folder])
             return s3_folder_url
         else:
             raise RuntimeError("Failed to upload model to S3")
@@ -580,26 +583,18 @@ async def train_model(
         raise
 
     finally:
-        # Cleanup only specified paths
+        # Only cleanup paths that were explicitly added after successful upload
         for path in cleanup_paths:
             try:
                 if os.path.exists(path):
                     if os.path.isfile(path):
                         os.remove(path)
-                        logger.debug("Removed file: %s", path)
+                        logger.debug("Removed temporary file: %s", path)
                     else:
                         shutil.rmtree(path, ignore_errors=True)
-                        logger.debug("Removed directory: %s", path)
+                        logger.debug("Removed temporary directory: %s", path)
             except Exception as e:
                 logger.error("Error cleaning up %s: %s", path, e)
-
-        # Always clean up dataset folder
-        if os.path.exists(dataset_folder):
-            try:
-                shutil.rmtree(dataset_folder, ignore_errors=True)
-                logger.debug("Removed dataset folder: %s", dataset_folder)
-            except Exception as e:
-                logger.error("Error cleaning up dataset folder: %s", e)
         
         clear_gpu_memory()
 
