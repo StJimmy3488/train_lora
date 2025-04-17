@@ -216,46 +216,54 @@ def process_images_and_captions(images, concept_sentence=None):
             local_image_paths.append(file_path)
 
         for image_path in local_image_paths:
-            with Image.open(path) as raw:
-                image = raw.convert("RGB")
+            try:
+                with Image.open(image_path) as raw:
+                    image = raw.convert("RGB")
 
-            prompt = "<DETAILED_CAPTION>"
-            inputs = processor(
-                text=prompt,
-                images=image,
-                return_tensors="pt"
-            ).to(device, torch_dtype)
+                prompt = "<DETAILED_CAPTION>"
+                inputs = processor(
+                    text=prompt,
+                    images=image,
+                    return_tensors="pt"
+                ).to(device, torch_dtype)
 
-            generated_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=3
-            )
+                generated_ids = model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=1024,
+                    num_beams=3
+                )
 
-            generated_text = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=False
-            )[0]
+                generated_text = processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=False
+                )[0]
 
-            parsed_answer = processor.post_process_generation(
-                generated_text,
-                task=prompt,
-                image_size=(image.width, image.height)
-            )
+                parsed_answer = processor.post_process_generation(
+                    generated_text,
+                    task=prompt,
+                    image_size=(image.width, image.height)
+                )
 
-            caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-            if concept_sentence:
-                caption = f"{caption} [trigger]"
+                caption = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
+                if concept_sentence:
+                    caption = f"{caption} [trigger]"
 
-            captions.append(caption)
-            logger.debug("Caption generated: %s", caption)
+                captions.append(caption)
+                logger.debug("Caption generated for %s: %s", image_path, caption)
+            except Exception as e:
+                logger.error(f"Error processing image {image_path}: {e}")
+                raise
 
     finally:
         # Cleanup downloaded images
         for path in local_image_paths:
-            if os.path.exists(path):
-                os.remove(path)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    logger.debug(f"Removed temporary image file: {path}")
+            except Exception as e:
+                logger.error(f"Error removing temporary file {path}: {e}")
 
         # Aggressive GPU memory cleanup
         if torch.cuda.is_available():
