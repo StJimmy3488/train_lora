@@ -478,13 +478,13 @@ async def train_lora(
         logger.info("3. Train the model using train_model function.")
         folder_url = await train_model(
             dataset_folder,
-    lora_name,
-    concept_sentence,
-    steps,
-    lr,
-    rank,
+            lora_name,
+            concept_sentence,
+            steps,
+            lr,
+            rank,
             model_type,
-    low_vram,
+            low_vram,
             sample_prompts,
             advanced_options
         )
