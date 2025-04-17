@@ -367,23 +367,33 @@ async def train_model(
 
         logger.debug("job object => %s", job)
         if job is None:
-            raise RuntimeError(f"get_job() returned None for config path: {config_path}. Please check your job definition.")
+            raise RuntimeError(f"get_job() returned None for config path: {config_path}.")
+
+        try:
+            job_start_time = time.time()
+            logger.info("Running job...")
+            job.run()
+            job_runtime = time.time() - job_start_time
+            logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
+        finally:
+            # Ensure cleanup happens even if job.run() fails
+            logger.info("Cleaning up job resources...")
+            if hasattr(job, 'cleanup') and callable(job.cleanup):
+                job.cleanup()
+            
+            # Manually clean up any remaining references
+            if hasattr(job, 'model'):
+                if hasattr(job.model, 'to'):
+                    job.model.to('cpu')
+                del job.model
+            
+            # Force garbage collection
+            clear_gpu_memory()
+            
+            # Clear the job reference
+            del job
 
         s3_folder_url = None # Initialize s3_folder_url outside try block
-
-        job_start_time = time.time() # Timing start for job.run()
-        logger.info("Running job...")
-        job.run()
-        job_runtime = time.time() - job_start_time # Calculate job runtime
-        logger.info(f"Job run completed in {job_runtime:.2f} seconds.") # Log job runtime
-
-        cleanup_start_time = time.time() # Timing start for job.cleanup()
-        logger.info("Cleaning up job...")
-        job.cleanup()
-        super.cleanup()
-
-        cleanup_runtime = time.time() - cleanup_start_time # Calculate cleanup runtime
-        logger.info(f"Job cleanup completed in {cleanup_runtime:.2f} seconds.") # Log cleanup runtime
 
         # Upload to S3
         bucket_name = os.environ.get("S3_BUCKET")
@@ -411,10 +421,18 @@ async def train_model(
             raise RuntimeError("S3 bucket not configured or model directory missing, cannot complete training.") # Raise error as S3 URL is essential
 
     except Exception as e_train_job:
-        clear_gpu_memory()  # Clear memory on error
+        logger.exception("Error during training job execution")
+        clear_gpu_memory()
         raise
     finally:
-        clear_gpu_memory()  # Always clear memory when done
+        # Clean up temporary files
+        if os.path.exists(config_path):
+            os.remove(config_path)
+        if os.path.exists(dataset_folder):
+            shutil.rmtree(dataset_folder, ignore_errors=True)
+        
+        # Final memory cleanup
+        clear_gpu_memory()
 
     if not s3_folder_url: # Check again after the try-except-finally block, in case S3 upload failed inside try
         msg = "Failed to obtain S3 folder URL after training, possibly due to upload failure or S3 configuration issues."
@@ -735,11 +753,20 @@ def clear_gpu_memory():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        # Force garbage collection
-        gc.collect()
+        # Force garbage collection multiple times
+        for _ in range(3):
+            gc.collect()
         
         # Optional: wait a moment for memory to be freed
         time.sleep(1)
+        
+        # Log memory stats
+        logger.debug(
+            "GPU Memory: Allocated: %.1f GB, Reserved: %.1f GB, Max: %.1f GB",
+            torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9,
+            torch.cuda.max_memory_allocated() / 1e9
+        )
 
 if __name__ == "__main__":
     import uvicorn
