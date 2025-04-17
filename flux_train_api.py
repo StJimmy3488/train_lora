@@ -589,67 +589,43 @@ def get_subprocess_env():
 
 def run_training_in_subprocess(request_dict, job_id):
     """Run the training in a separate Python process"""
-    cmd = [
-        sys.executable,  # Current Python interpreter
-        "-c",
-        f"""
-import sys, os, json, torch, gc
-sys.path.extend([os.getcwd(), "ai-toolkit"])
-from flux_train_api import train_lora
-
-# Setup GPU environment
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    gc.collect()
-
-try:
-    request_dict = json.loads('{json.dumps(request_dict)}')
-    import asyncio
-    result = asyncio.run(train_lora(**request_dict))
-finally:
-    # Cleanup GPU memory before exit
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        gc.collect()
-
-print(json.dumps(result))
-"""
-    ]
-    
     try:
+        # Convert request dict to JSON
+        request_json = json.dumps(request_dict)
+        
         # Run the subprocess with environment variables and timeout
         process = subprocess.Popen(
-            cmd,
+            [sys.executable, "train_subprocess.py"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=get_subprocess_env()
+            env=get_subprocess_env(),
+            text=True  # Use text mode for easier JSON handling
         )
         
-        # Wait for the process to complete with a timeout
-        stdout, stderr = process.communicate(timeout=7200)  # 2 hour timeout
+        # Send request data to subprocess
+        stdout, stderr = process.communicate(input=request_json, timeout=7200)
         
         if process.returncode != 0:
-            logger.error("Training subprocess failed: %s", stderr.decode())
-            return {"status": "error", "message": stderr.decode()}
+            logger.error("Training subprocess failed: %s", stderr)
+            return {"status": "error", "message": stderr}
         
-        # Parse the result
-        return json.loads(stdout.decode())
-        
+        try:
+            # Parse the result
+            return json.loads(stdout)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse subprocess output: %s\nOutput was: %s", e, stdout)
+            return {"status": "error", "message": f"Failed to parse training result: {e}"}
+            
     except subprocess.TimeoutExpired:
         logger.error("Training subprocess timed out")
         process.kill()
         return {"status": "error", "message": "Training timed out after 2 hours"}
     except Exception as e:
         logger.exception("Error running training subprocess")
-        if process.poll() is None:
+        if 'process' in locals() and process.poll() is None:
             process.kill()
         return {"status": "error", "message": str(e)}
-    finally:
-        # Ensure process is terminated
-        if process.poll() is None:
-            process.kill()
-            process.wait()
 
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
@@ -663,7 +639,7 @@ def run_training_job(job_id: str, request: TrainingRequest):
             conn.commit()
 
         # Convert request to dict for subprocess
-        request_dict = request.dict()
+        request_dict = request.model_dump()  # Use model_dump instead of dict
         
         # Run training in subprocess
         result = run_training_in_subprocess(request_dict, job_id)
