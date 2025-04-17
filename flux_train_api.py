@@ -42,7 +42,7 @@ from botocore.config import Config
 import os
 import gc
 import subprocess
-import multiprocessing
+
 
 def get_s3_client():
     """Create S3-compatible client for Cloudflare R2"""
