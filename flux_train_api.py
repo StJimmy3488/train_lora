@@ -524,6 +524,28 @@ class JobStatus(BaseModel):
     folder_url: Optional[str] = None
     error: Optional[str] = None
 
+async def _run_training_async(request_dict):
+    """Separate async function that can be pickled"""
+    # Reconstruct request from dict
+    request = TrainingRequest(**request_dict)
+    return await train_lora(
+        images=request.images,
+        lora_name=request.lora_name,
+        concept_sentence=request.concept_sentence,
+        steps=request.steps,
+        lr=request.lr,
+        rank=request.rank,
+        model_type=request.model_type,
+        low_vram=True,  # Force low_vram mode
+        sample_prompts=request.sample_prompts,
+        advanced_options=request.advanced_options
+    )
+
+def _run_in_process(request_dict):
+    """Function to run in separate process"""
+    import asyncio
+    return asyncio.run(_run_training_async(request_dict))
+
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
     try:
@@ -538,26 +560,13 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
 
-        # Run in a new process to ensure clean memory state
-        import multiprocessing
-        def run_async():
-            import asyncio
-            return asyncio.run(train_lora(
-                images=request.images,
-                lora_name=request.lora_name,
-                concept_sentence=request.concept_sentence,
-                steps=request.steps,
-                lr=request.lr,
-                rank=request.rank,
-                model_type=request.model_type,
-                low_vram=True,  # Force low_vram mode
-                sample_prompts=request.sample_prompts,
-                advanced_options=request.advanced_options
-            ))
+        # Convert request to dict for pickling
+        request_dict = request.dict()
 
         # Run in separate process
+        import multiprocessing
         with multiprocessing.Pool(1) as pool:
-            result = pool.apply(run_async)
+            result = pool.apply(_run_in_process, (request_dict,))
 
         # Handle result
         if result["status"] == "success":
