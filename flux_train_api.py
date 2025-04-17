@@ -73,7 +73,7 @@ def get_s3_client():
     )
 
 
-def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
+def upload_directory_to_s3(local_dir, bucket_name, s3_prefix, cleanup=True):
     """Uploads a directory to S3 while maintaining folder structure"""
     logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
                 local_dir, bucket_name, s3_prefix)
@@ -115,11 +115,12 @@ def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
         logger.exception("Error during S3 upload: %s", e)
         return False
     finally:
-        try:
-            logger.debug("Cleaning up local directory '%s'", local_dir)
-            shutil.rmtree(local_dir, ignore_errors=True)
-        except Exception as e:
-            logger.error("Error cleaning up local directory: %s", e)
+        if cleanup:
+            try:
+                logger.debug("Cleaning up local directory '%s'", local_dir)
+                shutil.rmtree(local_dir, ignore_errors=True)
+            except Exception as e:
+                logger.error("Error cleaning up local directory: %s", e)
 
 
 async def resolve_image_path(image_item):
@@ -331,6 +332,7 @@ async def train_model(
     job = None
     slugged_lora_name = slugify(lora_name)
     local_model_dir = f"output/{slugged_lora_name}"
+    upload_success = False
 
     try:
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
@@ -473,11 +475,7 @@ async def train_model(
             raise RuntimeError("S3_DOMAIN environment variable is not set")
 
         # After training, verify output directory
-        local_model_dir = f"output/{slugged_lora_name}"
-        logger.info("Checking for model output directory: %s", local_model_dir)
-        
         if not os.path.exists(local_model_dir):
-            # Log directory contents to help debug
             output_dir = "output"
             if os.path.exists(output_dir):
                 logger.error("Contents of output directory:")
@@ -496,9 +494,11 @@ async def train_model(
         s3_prefix = f"loras/flux/{slugged_lora_name}"
         logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
         
-        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
+        # Don't cleanup the directory during upload
+        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix, cleanup=False):
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
+            upload_success = True
             return s3_folder_url
         else:
             raise RuntimeError("Failed to upload model to S3")
@@ -521,9 +521,18 @@ async def train_model(
             if config_path and os.path.exists(config_path):
                 os.remove(config_path)
                 logger.debug("Removed config file: %s", config_path)
+            
             if os.path.exists(dataset_folder):
                 shutil.rmtree(dataset_folder, ignore_errors=True)
                 logger.debug("Removed dataset folder: %s", dataset_folder)
+            
+            # Only remove the model directory after successful upload
+            if upload_success and os.path.exists(local_model_dir):
+                logger.info("Upload successful, cleaning up model directory")
+                shutil.rmtree(local_model_dir, ignore_errors=True)
+                logger.debug("Removed model directory: %s", local_model_dir)
+            elif os.path.exists(local_model_dir):
+                logger.warning("Keeping model directory due to upload failure: %s", local_model_dir)
         except Exception as e:
             logger.error("Error during cleanup: %s", e)
         
