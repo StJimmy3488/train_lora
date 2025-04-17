@@ -279,15 +279,6 @@ async def create_dataset(images, captions):
 
     return destination_folder
 
-import os
-import shutil
-import yaml
-import logging
-from slugify import slugify
-from s3_utils import upload_directory_to_s3
-from toolkit.job import get_job
-
-logger = logging.getLogger(__name__)
 
 async def train_model(
     dataset_folder,
@@ -303,78 +294,108 @@ async def train_model(
 ):
     config_path = None
     save_cfg = None
-
     try:
-        slugged = slugify(lora_name)
-        logger.info("Training LoRA: %s (slug=%s)", lora_name, slugged)
+        slug = slugify(lora_name)
+        logger.info("Training LoRA '%s' (slug=%s)", lora_name, slug)
 
-        # Load base config
+        # Load base YAML
         with open("config/examples/train_lora_flux_24gb.yaml") as f:
             config = yaml.safe_load(f)
 
         clear_gpu_memory()
-
         proc = config["config"]["process"][0]
-        # Update core settings
-        proc.update({
-            # ... model, train, network, datasets ...
-            "save": {
-                "output_dir": f"output/{slugged}",
-                "push_to_hub": False
-            }
-        })
+
+        # ===== MODEL =====
+        model_id = (
+            "black-forest-labs/FLUX.1-schnell"
+            if model_type == "schnell"
+            else "black-forest-labs/FLUX.1"
+        )
+        proc.setdefault("model", {})["name_or_path"] = model_id
+        proc["model"]["low_vram"] = low_vram
+
+        # ===== TRAIN =====
+        proc.setdefault("train", {})
+        proc["train"]["steps"] = int(steps)
+        proc["train"]["lr"] = float(lr)
+        proc["train"]["disable_sampling"] = not bool(sample_prompts)
+
+        # ===== NETWORK =====
+        proc.setdefault("network", {})
+        proc["network"]["linear"] = int(rank)
+        proc["network"]["linear_alpha"] = int(rank)
+
+        # ===== DATASETS =====
+        proc["datasets"] = [{"folder_path": dataset_folder}]
+
+        # ===== SAMPLING =====
+        if sample_prompts:
+            proc.setdefault("sample", {})
+            proc["sample"]["prompts"] = sample_prompts
+            proc["sample"]["sample_every"] = steps
+            proc["sample"]["sample_steps"] = 28 if model_type == "dev" else 4
+
+        # ===== TRIGGER =====
+        if concept_sentence:
+            proc["trigger_word"] = concept_sentence
+
+        # ===== ADVANCED OVERRIDES =====
+        if advanced_options:
+            advanced_cfg = yaml.safe_load(advanced_options)
+            def recursive_update(d, u):
+                for k, v in u.items():
+                    if isinstance(v, dict) and v:
+                        d[k] = recursive_update(d.get(k, {}), v)
+                    else:
+                        d[k] = v
+                return d
+            proc = recursive_update(proc, advanced_cfg)
+            config["config"]["process"][0] = proc
+
+        # ===== SAVE =====
+        output_dir = f"output/{slug}"
+        proc["save"] = {"output_dir": output_dir, "push_to_hub": False}
         save_cfg = proc["save"]
 
-        # Persist updated config
-        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged}.yaml"
+        # Write the final config
+        config_path = f"tmp_configs/{uuid.uuid4()}-{slug}.yaml"
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w") as f:
             yaml.dump(config, f)
+        logger.debug("Config saved to %s; model will output in %s", config_path, output_dir)
 
-        logger.debug("Config written to %s, will save to %s", config_path, save_cfg["output_dir"])
-
-        # Run the job
-        job = get_job(config_path, slugged)
+        # Launch the job
+        job = get_job(config_path, slug)
         if job is None:
             raise RuntimeError(f"get_job() returned None for config {config_path}")
-
         try:
             job.run()
         finally:
-            # ensure we always clean up job internals
-            if hasattr(job, 'cleanup'):
+            if hasattr(job, "cleanup"):
                 job.cleanup()
 
-        # Verify output directory
-        local_dir = save_cfg["output_dir"]
-        logger.info("Checking for output at %s", local_dir)
-        if not os.path.exists(local_dir):
-            parent = os.path.dirname(local_dir)
-            if os.path.exists(parent):
-                logger.error("%s contents: %s", parent, os.listdir(parent))
-            else:
-                logger.error("Parent %s does not exist", parent)
-            raise RuntimeError(f"Model output directory '{local_dir}' was not created during training")
+        # Verify output
+        if not os.path.isdir(output_dir):
+            parent = os.path.dirname(output_dir)
+            logger.error("Missing dir %s; contents: %s", parent, os.listdir(parent) if os.path.exists(parent) else "<none>")
+            raise RuntimeError(f"Model output directory '{output_dir}' was not created during training")
 
-        # Upload
+        # Upload to S3
         bucket = os.getenv("S3_BUCKET")
-        prefix = f"loras/flux/{slugged}"
-        if upload_directory_to_s3(local_dir, bucket, prefix):
+        prefix = f"loras/flux/{slug}"
+        if upload_directory_to_s3(output_dir, bucket, prefix):
             return f"{os.getenv('S3_DOMAIN')}/{prefix}/"
         else:
             raise RuntimeError("Failed to upload model to S3")
 
-    except Exception:
-        clear_gpu_memory()
-        raise
-
     finally:
-        # clean up config and dataset folder if they exist
+        # Cleanup config + dataset
         if config_path and os.path.exists(config_path):
             os.remove(config_path)
         if dataset_folder and os.path.exists(dataset_folder):
             shutil.rmtree(dataset_folder, ignore_errors=True)
         clear_gpu_memory()
+
 
 
 def recursive_update(d, u):
@@ -618,9 +639,9 @@ def run_training_job(job_id: str, request: TrainingRequest):
                 ("failed", str(e), job_id)
             )
             conn.commit()
+            
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
-    # Atomically check + insert to prevent concurrent jobs
     with get_db() as conn:
         conn.execute("BEGIN IMMEDIATE;")
         running = conn.execute(
@@ -634,16 +655,14 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
             "INSERT INTO jobs (job_id, status, progress) VALUES (?, ?, ?)",
             (job_id, "initializing", 0.0)
         )
-        conn.commit()  # releases the IMMEDIATE lock
+        conn.commit()
 
     background_tasks.add_task(run_training_job, job_id, request)
-
     return TrainingResponse(
         job_id=job_id,
         status="accepted",
         message="Training job started successfully"
     )
-
 @app.get("/status/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
     """Get the status of a training job"""
