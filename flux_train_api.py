@@ -409,6 +409,24 @@ async def train_model(
         with open(config_path, "w") as f:
             yaml.dump(config, f)
 
+        # Verify dataset exists and has content
+        if not os.path.exists(dataset_folder):
+            raise RuntimeError(f"Dataset folder '{dataset_folder}' does not exist")
+        dataset_files = os.listdir(dataset_folder)
+        logger.info("Dataset contents: %s", dataset_files)
+        if not dataset_files:
+            raise RuntimeError(f"Dataset folder '{dataset_folder}' is empty")
+        
+        # Verify metadata.jsonl exists and has content
+        metadata_path = os.path.join(dataset_folder, "metadata.jsonl")
+        if not os.path.exists(metadata_path):
+            raise RuntimeError(f"metadata.jsonl not found in dataset folder")
+        with open(metadata_path, 'r') as f:
+            metadata_lines = f.readlines()
+            logger.info("Number of training examples: %d", len(metadata_lines))
+            if not metadata_lines:
+                raise RuntimeError("metadata.jsonl is empty")
+
         # Run training with more detailed logging
         logger.info("Retrieving job with config path: %s", config_path)
         job = get_job(config_path, slugged_lora_name)
@@ -420,6 +438,17 @@ async def train_model(
         try:
             job_start_time = time.time()
             logger.info("Running job...")
+            
+            # Log job attributes
+            logger.info("Job attributes:")
+            for attr in dir(job):
+                if not attr.startswith('_'):  # Skip private attributes
+                    try:
+                        value = getattr(job, attr)
+                        if not callable(value):  # Skip methods
+                            logger.info("  %s: %s", attr, value)
+                    except Exception as e:
+                        logger.warning("Could not get attribute %s: %s", attr, e)
             
             # Verify output directory exists and is writable
             if not os.path.exists(local_model_dir):
@@ -439,9 +468,30 @@ async def train_model(
                 raise RuntimeError("Job object does not have a valid run method")
             
             try:
-                # Add intermediate progress checks
+                # Monitor training progress
+                def log_progress():
+                    while True:
+                        if hasattr(job, 'progress'):
+                            logger.info("Training progress: %.2f%%", job.progress * 100)
+                        time.sleep(30)  # Log every 30 seconds
+
+                import threading
+                progress_thread = threading.Thread(target=log_progress)
+                progress_thread.daemon = True
+                progress_thread.start()
+
+                # Run the job
                 job.run()
                 logger.info("Job run() completed")
+                
+                # Stop progress thread
+                progress_thread.join(timeout=1)
+                
+                # Check GPU memory usage
+                if torch.cuda.is_available():
+                    logger.info("GPU Memory after training: Allocated: %.1f GB, Max: %.1f GB",
+                              torch.cuda.memory_allocated() / 1e9,
+                              torch.cuda.max_memory_allocated() / 1e9)
                 
                 # Immediately check if files were created
                 if os.path.exists(local_model_dir):
@@ -454,7 +504,13 @@ async def train_model(
                                 logger.info("Found files in subdirectory %s: %s", root, files)
                                 break
                         else:
-                            raise RuntimeError(f"No files were created in output directory '{local_model_dir}' or its subdirectories")
+                            # Try to get any error information from the job
+                            error_info = ""
+                            if hasattr(job, 'last_error'):
+                                error_info = f" Job error: {job.last_error}"
+                            elif hasattr(job, 'get_error'):
+                                error_info = f" Job error: {job.get_error()}"
+                            raise RuntimeError(f"No files were created in output directory '{local_model_dir}' or its subdirectories.{error_info}")
                 else:
                     raise RuntimeError(f"Output directory '{local_model_dir}' was deleted during training")
                 
