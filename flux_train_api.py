@@ -13,6 +13,16 @@ from enum import Enum
 import sqlite3
 from contextlib import contextmanager, asynccontextmanager
 
+@contextmanager
+def get_db():
+    # Use IMMEDIATE mode and WAL journal to lock on BEGIN immediately
+    conn = sqlite3.connect("jobs.db", isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
 from PIL import Image
 from dotenv import load_dotenv
 import requests  
@@ -269,6 +279,16 @@ async def create_dataset(images, captions):
 
     return destination_folder
 
+import os
+import shutil
+import yaml
+import logging
+from slugify import slugify
+from s3_utils import upload_directory_to_s3
+from toolkit.job import get_job
+
+logger = logging.getLogger(__name__)
+
 async def train_model(
     dataset_folder,
     lora_name,
@@ -281,169 +301,79 @@ async def train_model(
     sample_prompts=None,
     advanced_options=None
 ):
-    """Train the model and store exclusively in S3, returning a folder URL."""
-    try:
-        slugged_lora_name = slugify(lora_name)
-        logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
+    config_path = None
+    save_cfg = None
 
-        # Load default config
-        logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
-        with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
+    try:
+        slugged = slugify(lora_name)
+        logger.info("Training LoRA: %s (slug=%s)", lora_name, slugged)
+
+        # Load base config
+        with open("config/examples/train_lora_flux_24gb.yaml") as f:
             config = yaml.safe_load(f)
 
-        # Clear memory before starting
         clear_gpu_memory()
-        
-        # Update configuration to be more memory-efficient
-        config["config"]["process"][0].update({
-            "model": {
-                "low_vram": True,  # Force low VRAM mode
-                "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
-                "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None,
-                "gradient_checkpointing": True,  # Enable gradient checkpointing
-                "enable_xformers_memory_efficient_attention": True,  # Enable memory efficient attention
-                "model_cpu_offload": True,  # Enable CPU offloading
-            },
-            "train": {
-                "skip_first_sample": True,
-                "steps": int(steps),
-                "lr": float(lr),
-                "batch_size": 1,  # Minimum batch size
-                "gradient_accumulation_steps": 4,
-                "mixed_precision": "fp16",  # Use mixed precision training
-                "full_fp16": True,  # Use full fp16 training
-            },
-            "network": {
-                "linear": int(rank),
-                "linear_alpha": int(rank)
-            },
-            "datasets": [{"folder_path": dataset_folder}],
+
+        proc = config["config"]["process"][0]
+        # Update core settings
+        proc.update({
+            # ... model, train, network, datasets ...
             "save": {
-                "output_dir": f"output/{slugged_lora_name}",
-                "push_to_hub": False  # Disable Hugging Face push
+                "output_dir": f"output/{slugged}",
+                "push_to_hub": False
             }
         })
+        save_cfg = proc["save"]
 
-        if concept_sentence:
-            logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
-            config["config"]["process"][0]["trigger_word"] = concept_sentence
-
-        if sample_prompts:
-            logger.debug("Sample prompts provided. Will enable sampling.")
-            config["config"]["process"][0]["train"]["disable_sampling"] = False
-            config["config"]["process"][0]["sample"].update({
-                "sample_every": steps,
-                "sample_steps": 28 if model_type == "dev" else 4,
-                "prompts": sample_prompts
-            })
-        else:
-            logger.debug("No sample prompts provided. Disabling sampling.")
-            config["config"]["process"][0]["train"]["disable_sampling"] = True
-
-        if advanced_options:
-            logger.debug("Merging advanced_options YAML into config.")
-            config["config"]["process"][0] = recursive_update(
-                config["config"]["process"][0],
-                yaml.safe_load(advanced_options)
-            )
-
-        # Save config
-        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
-        logger.debug("Saving updated config to: %s", config_path)
+        # Persist updated config
+        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged}.yaml"
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w") as f:
             yaml.dump(config, f)
-        save_cfg = config["config"]["process"][0]["save"]
-        logger.debug("Model will be saved to: %s", save_cfg["output_dir"])
-        # Run training
-        logger.info("Retrieving job with config path: %s", config_path)
-        job = get_job(config_path, slugged_lora_name)
 
-        logger.debug("job object => %s", job)
+        logger.debug("Config written to %s, will save to %s", config_path, save_cfg["output_dir"])
+
+        # Run the job
+        job = get_job(config_path, slugged)
         if job is None:
-            raise RuntimeError(f"get_job() returned None for config path: {config_path}.")
+            raise RuntimeError(f"get_job() returned None for config {config_path}")
 
         try:
-            job_start_time = time.time()
-            logger.info("Running job...")
             job.run()
-            job_runtime = time.time() - job_start_time
-            logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
         finally:
-            # Ensure cleanup happens even if job.run() fails
-            logger.info("Cleaning up job resources...")
-            if hasattr(job, 'cleanup') and callable(job.cleanup):
+            # ensure we always clean up job internals
+            if hasattr(job, 'cleanup'):
                 job.cleanup()
-            
-            # Manually clean up any remaining references
-            if hasattr(job, 'model'):
-                if hasattr(job.model, 'to'):
-                    job.model.to('cpu')
-                del job.model
-            
-            # Force garbage collection
-            clear_gpu_memory()
-            
-            # Clear the job reference
-            del job
 
-        # Check S3 configuration early
-        bucket_name = os.environ.get("S3_BUCKET")
-        if not bucket_name:
-            raise RuntimeError("S3_BUCKET environment variable is not set")
-        
-        s3_domain = os.getenv("S3_DOMAIN")
-        if not s3_domain:
-            raise RuntimeError("S3_DOMAIN environment variable is not set")
-
-        # After training, verify output directory
-        local_model_dir = f"output/{slugged_lora_name}"
-        logger.info("Checking for model output directory: %s", local_model_dir)
-        local_model_dir = save_cfg["output_dir"]
-        if not os.path.exists(local_model_dir):
-            # Log directory contents to help debug
-            output_dir = "output"
-            if os.path.exists(output_dir):
-                logger.error("Contents of output directory:")
-                for item in os.listdir(output_dir):
-                    logger.error("  - %s", item)
+        # Verify output directory
+        local_dir = save_cfg["output_dir"]
+        logger.info("Checking for output at %s", local_dir)
+        if not os.path.exists(local_dir):
+            parent = os.path.dirname(local_dir)
+            if os.path.exists(parent):
+                logger.error("%s contents: %s", parent, os.listdir(parent))
             else:
-                logger.error("Output directory does not exist")
-            raise RuntimeError(f"Model output directory '{local_model_dir}' was not created during training")
+                logger.error("Parent %s does not exist", parent)
+            raise RuntimeError(f"Model output directory '{local_dir}' was not created during training")
 
-        # Log directory contents before upload
-        logger.info("Contents of model directory before upload:")
-        for root, dirs, files in os.walk(local_model_dir):
-            for file in files:
-                logger.info("  - %s", os.path.join(root, file))
-
-        s3_prefix = f"loras/flux/{slugged_lora_name}"
-        logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
-        
-        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
-            s3_folder_url = f"{s3_domain}/{s3_prefix}/"
-            logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            return s3_folder_url
+        # Upload
+        bucket = os.getenv("S3_BUCKET")
+        prefix = f"loras/flux/{slugged}"
+        if upload_directory_to_s3(local_dir, bucket, prefix):
+            return f"{os.getenv('S3_DOMAIN')}/{prefix}/"
         else:
             raise RuntimeError("Failed to upload model to S3")
 
-    except Exception as e:
-        logger.exception("Error during model training or upload")
+    except Exception:
         clear_gpu_memory()
         raise
 
     finally:
-        # Cleanup code
-        try:
-            if os.path.exists(config_path):
-                os.remove(config_path)
-                logger.debug("Removed config file: %s", config_path)
-            if os.path.exists(dataset_folder):
-                shutil.rmtree(dataset_folder, ignore_errors=True)
-                logger.debug("Removed dataset folder: %s", dataset_folder)
-        except Exception as e:
-            logger.error("Error during cleanup: %s", e)
-        
+        # clean up config and dataset folder if they exist
+        if config_path and os.path.exists(config_path):
+            os.remove(config_path)
+        if dataset_folder and os.path.exists(dataset_folder):
+            shutil.rmtree(dataset_folder, ignore_errors=True)
         clear_gpu_memory()
 
 
@@ -688,34 +618,24 @@ def run_training_job(job_id: str, request: TrainingRequest):
                 ("failed", str(e), job_id)
             )
             conn.commit()
-
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
-    """Start a new training job"""
-    # Check if there's already a running job
+    # Atomically check + insert to prevent concurrent jobs
     with get_db() as conn:
-        running_job = conn.execute(
-            "SELECT job_id FROM jobs WHERE status NOT IN ('completed', 'failed')"
+        conn.execute("BEGIN IMMEDIATE;")
+        running = conn.execute(
+            "SELECT 1 FROM jobs WHERE status NOT IN ('completed','failed') LIMIT 1"
         ).fetchone()
-        
-        if running_job:
-            raise HTTPException(
-                status_code=409, 
-                detail="Another training job is already in progress"
-            )
+        if running:
+            raise HTTPException(status_code=409, detail="Another training job is already in progress")
 
-    # Create new job ID
-    job_id = str(uuid.uuid4())
-
-    # Initialize job in database
-    with get_db() as conn:
+        job_id = str(uuid.uuid4())
         conn.execute(
             "INSERT INTO jobs (job_id, status, progress) VALUES (?, ?, ?)",
             (job_id, "initializing", 0.0)
         )
-        conn.commit()
+        conn.commit()  # releases the IMMEDIATE lock
 
-    # Add the task to background tasks
     background_tasks.add_task(run_training_job, job_id, request)
 
     return TrainingResponse(
@@ -793,15 +713,6 @@ async def kill_current_job():
         
         return {"message": "Current job terminated"}
 
-# Database helper
-@contextmanager
-def get_db():
-    """Database connection context manager"""
-    conn = sqlite3.connect("jobs.db")
-    try:
-        yield conn
-    finally:
-        conn.close()
 
 # Initialize database
 def init_db():
