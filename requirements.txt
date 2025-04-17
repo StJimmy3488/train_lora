@@ -39,3 +39,4 @@ pytorch-wavelets==1.3.0
 matplotlib==3.10.1
 psutil
 boto3
+nvidia-smi

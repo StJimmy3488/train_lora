@@ -41,6 +41,9 @@ import boto3
 from botocore.config import Config
 import os
 import gc
+import signal
+import psutil
+import nvidia_smi  # Add this import at the top
 
 def get_s3_client():
     """Create S3-compatible client for Cloudflare R2"""
@@ -69,28 +72,51 @@ def get_s3_client():
 
 def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
     """Uploads a directory to S3 while maintaining folder structure"""
-    logger.info("Uploading directory '%s' to S3 bucket '%s' with prefix '%s'.",
+    logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
                 local_dir, bucket_name, s3_prefix)
+    
+    if not os.path.exists(local_dir):
+        logger.error("Local directory '%s' does not exist", local_dir)
+        return False
+        
     try:
         s3 = get_s3_client()
+        
+        # Count files first
+        total_files = sum([len(files) for _, _, files in os.walk(local_dir)])
+        logger.info("Found %d files to upload", total_files)
+        
+        uploaded_files = 0
         for root, _, files in os.walk(local_dir):
             for file in files:
                 local_path = os.path.join(root, file)
                 relative_path = os.path.relpath(local_path, local_dir)
                 s3_key = f"{s3_prefix}/{relative_path}"
-                logger.debug("Uploading file '%s' to '%s'.", local_path, s3_key)
-                s3.upload_file(local_path, bucket_name, s3_key)
-        return True
+                
+                try:
+                    logger.debug("Uploading file %d/%d: '%s' to '%s'",
+                               uploaded_files + 1, total_files, local_path, s3_key)
+                    s3.upload_file(local_path, bucket_name, s3_key)
+                    uploaded_files += 1
+                except Exception as e:
+                    logger.error("Failed to upload '%s': %s", local_path, e)
+                    return False
+                
+        logger.info("Successfully uploaded %d/%d files", uploaded_files, total_files)
+        return uploaded_files > 0  # Return True only if we uploaded at least one file
+        
     except NoCredentialsError:
-        logger.error("AWS credentials not available.")
+        logger.error("AWS credentials not available")
         return False
     except Exception as e:
-        logger.exception("Error uploading to S3: %s", e)
+        logger.exception("Error during S3 upload: %s", e)
         return False
     finally:
-        # Clean up local directory regardless of upload success
-        logger.debug("Removing local directory '%s'.", local_dir)
-        shutil.rmtree(local_dir, ignore_errors=True)
+        try:
+            logger.debug("Cleaning up local directory '%s'", local_dir)
+            shutil.rmtree(local_dir, ignore_errors=True)
+        except Exception as e:
+            logger.error("Error cleaning up local directory: %s", e)
 
 
 async def resolve_image_path(image_item):
@@ -289,15 +315,15 @@ async def train_model(
     advanced_options=None
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
-    slugged_lora_name = slugify(lora_name)
-    logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
-
-    # Load default config
-    logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
-    with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
-        config = yaml.safe_load(f)
-
     try:
+        slugged_lora_name = slugify(lora_name)
+        logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
+
+        # Load default config
+        logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
+        with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
+            config = yaml.safe_load(f)
+
         # Clear memory before starting
         clear_gpu_memory()
         
@@ -375,71 +401,96 @@ async def train_model(
             job.run()
             job_runtime = time.time() - job_start_time
             logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
+        except Exception as e:
+            logger.exception("Error during job execution")
+            raise
         finally:
             # Ensure cleanup happens even if job.run() fails
             logger.info("Cleaning up job resources...")
-            if hasattr(job, 'cleanup') and callable(job.cleanup):
-                job.cleanup()
-            
-            # Manually clean up any remaining references
-            if hasattr(job, 'model'):
-                if hasattr(job.model, 'to'):
-                    job.model.to('cpu')
-                del job.model
-            
-            # Force garbage collection
-            clear_gpu_memory()
-            
-            # Clear the job reference
-            del job
+            try:
+                if hasattr(job, 'cleanup') and callable(job.cleanup):
+                    job.cleanup()
+                
+                # Manually clean up any remaining references
+                if hasattr(job, 'model'):
+                    if hasattr(job.model, 'to'):
+                        job.model.to('cpu')
+                    del job.model
+                
+                # Clear all job attributes
+                for attr in dir(job):
+                    if not attr.startswith('__'):
+                        try:
+                            delattr(job, attr)
+                        except:
+                            pass
+                
+                # Force cleanup
+                force_gpu_cleanup()
+                
+                # Clear the job reference
+                del job
+                
+            except Exception as cleanup_error:
+                logger.error(f"Error during job cleanup: {cleanup_error}")
+                force_gpu_cleanup()
 
-        s3_folder_url = None # Initialize s3_folder_url outside try block
-
-        # Upload to S3
+        # Check S3 configuration early
         bucket_name = os.environ.get("S3_BUCKET")
-        s3_domain = os.getenv("S3_DOMAIN", "https://r2.syntx.ai")
-        local_model_dir = f"output/{slugged_lora_name}"
-
-
-        if bucket_name and os.path.exists(local_model_dir):
-            s3_prefix = f"loras/flux/{slugged_lora_name}"
-            logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
-            upload_start_time = time.time() # Timing start for S3 upload
-            logger.info("Starting S3 upload...")
-            if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
-                upload_runtime = time.time() - upload_start_time # Calculate upload runtime
-                logger.info(f"S3 upload completed in {upload_runtime:.2f} seconds.") # Log upload runtime
-
-                # Construct an HTTP-based "folder" URL on Timeweb S3
-                # s3_endpoint = os.environ.get("S3_ENDPOINT", "https://s3.timeweb.cloud").rstrip("/")
-                s3_folder_url = f"{s3_domain}/{s3_prefix}/"
-                logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            else:
-                raise RuntimeError("upload_directory_to_s3 returned False indicating failure.") # Explicitly raise error if upload fails
-        else:
-            logger.warning("No S3_BUCKET set or local_model_dir does not exist. Skipping upload.")
-            raise RuntimeError("S3 bucket not configured or model directory missing, cannot complete training.") # Raise error as S3 URL is essential
-
-    except Exception as e_train_job:
-        logger.exception("Error during training job execution")
-        clear_gpu_memory()
-        raise
-    finally:
-        # Clean up temporary files
-        if os.path.exists(config_path):
-            os.remove(config_path)
-        if os.path.exists(dataset_folder):
-            shutil.rmtree(dataset_folder, ignore_errors=True)
+        if not bucket_name:
+            raise RuntimeError("S3_BUCKET environment variable is not set")
         
-        # Final memory cleanup
-        clear_gpu_memory()
+        s3_domain = os.getenv("S3_DOMAIN")
+        if not s3_domain:
+            raise RuntimeError("S3_DOMAIN environment variable is not set")
 
-    if not s3_folder_url: # Check again after the try-except-finally block, in case S3 upload failed inside try
-        msg = "Failed to obtain S3 folder URL after training, possibly due to upload failure or S3 configuration issues."
-        logger.error(msg)
-        raise RuntimeError(msg)
+        # After training, verify output directory
+        local_model_dir = f"output/{slugged_lora_name}"
+        logger.info("Checking for model output directory: %s", local_model_dir)
+        
+        if not os.path.exists(local_model_dir):
+            # Log directory contents to help debug
+            output_dir = "output"
+            if os.path.exists(output_dir):
+                logger.error("Contents of output directory:")
+                for item in os.listdir(output_dir):
+                    logger.error("  - %s", item)
+            else:
+                logger.error("Output directory does not exist")
+            raise RuntimeError(f"Model output directory '{local_model_dir}' was not created during training")
 
-    return s3_folder_url
+        # Log directory contents before upload
+        logger.info("Contents of model directory before upload:")
+        for root, dirs, files in os.walk(local_model_dir):
+            for file in files:
+                logger.info("  - %s", os.path.join(root, file))
+
+        s3_prefix = f"loras/flux/{slugged_lora_name}"
+        logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
+        
+        if upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix):
+            s3_folder_url = f"{s3_domain}/{s3_prefix}/"
+            logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
+            return s3_folder_url
+        else:
+            raise RuntimeError("Failed to upload model to S3")
+
+    except Exception as e:
+        logger.exception("Error during model training or upload")
+        force_gpu_cleanup()
+        raise
+
+    finally:
+        # Cleanup code
+        try:
+            if os.path.exists(config_path):
+                os.remove(config_path)
+            if os.path.exists(dataset_folder):
+                shutil.rmtree(dataset_folder, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        
+        force_gpu_cleanup()
 
 
 def recursive_update(d, u):
@@ -501,17 +552,108 @@ async def train_lora(
         logger.debug("Final cleanup (check if tmp dirs are removed by train_model's finally).")
 
 
+def force_gpu_cleanup():
+    """Force cleanup of GPU memory and processes"""
+    try:
+        # Kill any remaining CUDA processes
+        current_process = psutil.Process()
+        for child in current_process.children(recursive=True):
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+        # Reset NVIDIA GPU state
+        if torch.cuda.is_available():
+            try:
+                nvidia_smi.nvmlInit()
+                deviceCount = nvidia_smi.nvmlDeviceGetCount()
+                for i in range(deviceCount):
+                    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
+                    nvidia_smi.nvmlDeviceSetComputeMode(handle, 0)  # Set to DEFAULT
+                nvidia_smi.nvmlShutdown()
+            except Exception as e:
+                logger.error(f"Error resetting NVIDIA GPU state: {e}")
+
+        # Clear PyTorch CUDA memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+                    torch.cuda.reset_accumulated_memory_stats()
+
+        # Force garbage collection
+        for _ in range(5):
+            gc.collect()
+
+        # Optional: wait for memory to be freed
+        time.sleep(2)
+
+    except Exception as e:
+        logger.error(f"Error during force cleanup: {e}")
+
+def clear_gpu_memory():
+    """Aggressively clear GPU memory"""
+    if torch.cuda.is_available():
+        try:
+            # Move all tensors to CPU
+            for obj in gc.get_objects():
+                if torch.is_tensor(obj):
+                    if obj.is_cuda:
+                        obj.cpu()
+                elif hasattr(obj, 'cuda') and callable(obj.cuda):
+                    obj.to('cpu')
+
+            # Clear CUDA memory
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            
+            # Force garbage collection multiple times
+            for _ in range(3):
+                gc.collect()
+            
+            # Log memory stats
+            logger.debug(
+                "GPU Memory: Allocated: %.1f GB, Reserved: %.1f GB, Max: %.1f GB",
+                torch.cuda.memory_allocated() / 1e9,
+                torch.cuda.memory_reserved() / 1e9,
+                torch.cuda.max_memory_allocated() / 1e9
+            )
+
+            # If memory usage is still high, force cleanup
+            if torch.cuda.memory_allocated() > 1e9:  # If more than 1GB is still allocated
+                logger.warning("High memory usage detected after cleanup, forcing aggressive cleanup")
+                force_gpu_cleanup()
+                
+        except Exception as e:
+            logger.error(f"Error during memory cleanup: {e}")
+            force_gpu_cleanup()
+
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown"""
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, cleaning up...")
+        force_gpu_cleanup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    setup_signal_handlers()
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.7)  # Reduce to 70% to leave more headroom
-        torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(0.7)
+        clear_gpu_memory()
     init_db()
     yield
     # Shutdown
-    clear_gpu_memory()
+    force_gpu_cleanup()
 
 app = FastAPI(title="FLUX LoRA Trainer API", lifespan=lifespan)
 
@@ -548,10 +690,8 @@ class JobStatus(BaseModel):
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
     try:
-        # Clear CUDA cache at the start of each job
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+        # Clear memory at start
+        force_gpu_cleanup()
 
         # Update job status to processing
         with get_db() as conn:
@@ -602,10 +742,8 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
     finally:
-        # Ensure CUDA cache is cleared after job completion
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Force cleanup after job completion or failure
+        force_gpu_cleanup()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
@@ -745,28 +883,6 @@ def device_context(device="cuda"):
         if device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
-
-def clear_gpu_memory():
-    """Aggressively clear GPU memory"""
-    if torch.cuda.is_available():
-        # Clear PyTorch's CUDA memory cache
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        # Force garbage collection multiple times
-        for _ in range(3):
-            gc.collect()
-        
-        # Optional: wait a moment for memory to be freed
-        time.sleep(1)
-        
-        # Log memory stats
-        logger.debug(
-            "GPU Memory: Allocated: %.1f GB, Reserved: %.1f GB, Max: %.1f GB",
-            torch.cuda.memory_allocated() / 1e9,
-            torch.cuda.memory_reserved() / 1e9,
-            torch.cuda.max_memory_allocated() / 1e9
-        )
 
 if __name__ == "__main__":
     import uvicorn
