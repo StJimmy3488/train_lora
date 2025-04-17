@@ -409,7 +409,7 @@ async def train_model(
         with open(config_path, "w") as f:
             yaml.dump(config, f)
 
-        # Run training
+        # Run training with more detailed logging
         logger.info("Retrieving job with config path: %s", config_path)
         job = get_job(config_path, slugged_lora_name)
 
@@ -421,28 +421,59 @@ async def train_model(
             job_start_time = time.time()
             logger.info("Running job...")
             
-            # Check if the job has the required methods
+            # Verify output directory exists and is writable
+            if not os.path.exists(local_model_dir):
+                os.makedirs(local_model_dir, exist_ok=True)
+            if not os.access(local_model_dir, os.W_OK):
+                raise RuntimeError(f"Output directory '{local_model_dir}' is not writable")
+            
+            # Log initial directory state
+            logger.info("Output directory before training: %s", os.listdir(local_model_dir))
+            
+            # Check job configuration
+            if hasattr(job, 'config'):
+                logger.info("Job configuration: %s", job.config)
+            
+            # Run the job with progress logging
             if not hasattr(job, 'run') or not callable(job.run):
                 raise RuntimeError("Job object does not have a valid run method")
             
-            # Run the job and capture any potential exceptions
             try:
+                # Add intermediate progress checks
                 job.run()
+                logger.info("Job run() completed")
+                
+                # Immediately check if files were created
+                if os.path.exists(local_model_dir):
+                    files = os.listdir(local_model_dir)
+                    logger.info("Files created during training: %s", files)
+                    if not files:
+                        # Check if files might be in a subdirectory
+                        for root, dirs, files in os.walk(local_model_dir):
+                            if files:
+                                logger.info("Found files in subdirectory %s: %s", root, files)
+                                break
+                        else:
+                            raise RuntimeError(f"No files were created in output directory '{local_model_dir}' or its subdirectories")
+                else:
+                    raise RuntimeError(f"Output directory '{local_model_dir}' was deleted during training")
+                
             except Exception as e:
                 logger.exception("Error during job.run()")
+                # Try to capture any error output from the job
+                if hasattr(job, 'get_error'):
+                    error_details = job.get_error()
+                    logger.error("Job error details: %s", error_details)
                 raise RuntimeError(f"Training job failed: {str(e)}")
             
             job_runtime = time.time() - job_start_time
-            logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
+            logger.info(f"Job run completed in {job_runtime:.2f} seconds")
 
-            # Verify the output directory contents after training
-            if os.path.exists(local_model_dir):
-                files = os.listdir(local_model_dir)
-                logger.info(f"Output directory contents: {files}")
-                if not files:
-                    raise RuntimeError(f"Output directory '{local_model_dir}' exists but is empty")
-            else:
-                raise RuntimeError(f"Output directory '{local_model_dir}' was not created during training")
+            # Verify expected model files exist
+            expected_files = ['pytorch_lora_weights.bin', 'config.json']
+            missing_files = [f for f in expected_files if not os.path.exists(os.path.join(local_model_dir, f))]
+            if missing_files:
+                raise RuntimeError(f"Missing expected model files: {missing_files}")
 
         finally:
             # Ensure cleanup happens even if job.run() fails
