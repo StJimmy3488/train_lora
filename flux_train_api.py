@@ -584,17 +584,17 @@ async def train_model(
 
     finally:
         # Only cleanup paths that were explicitly added after successful upload
-        for path in cleanup_paths:
-            try:
-                if os.path.exists(path):
-                    if os.path.isfile(path):
-                        os.remove(path)
-                        logger.debug("Removed temporary file: %s", path)
-                    else:
-                        shutil.rmtree(path, ignore_errors=True)
-                        logger.debug("Removed temporary directory: %s", path)
-            except Exception as e:
-                logger.error("Error cleaning up %s: %s", path, e)
+        # for path in cleanup_paths:
+        #     try:
+        #         if os.path.exists(path):
+        #             if os.path.isfile(path):
+        #                 os.remove(path)
+        #                 logger.debug("Removed temporary file: %s", path)
+        #             else:
+        #                 shutil.rmtree(path, ignore_errors=True)
+        #                 logger.debug("Removed temporary directory: %s", path)
+        #     except Exception as e:
+        #         logger.error("Error cleaning up %s: %s", path, e)
         
         clear_gpu_memory()
 
@@ -850,19 +850,22 @@ def run_training_job(job_id: str, request: TrainingRequest):
         result = run_training_in_subprocess(request_dict, job_id)
 
         if result["status"] == "success":
-            # Update final status
+            # --- Solution A: Explicitly delete model & dataset folders here, after a successful upload ---
+            from slugify import slugify
+            slug = slugify(request.lora_name)
+            # This must match whatever you set as training_folder/output_dir in train_model
+            model_dir = f"output/{slug}"
+            dataset_dir = f"tmp_datasets/{slug}"  # if you used slug for your tmp_datasets too
+            import shutil, os
+            for d in (dataset_dir, model_dir):
+                if os.path.exists(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                    logger.debug("Cleaned up directory after successful run: %s", d)
+            # Now mark the job completed in the DB
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
                     ("completed", 1.0, result["folder_url"], job_id)
-                )
-                conn.commit()
-        else:
-            # Update error status
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-                    ("failed", result["message"], job_id)
                 )
                 conn.commit()
 
