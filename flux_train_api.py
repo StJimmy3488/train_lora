@@ -380,6 +380,8 @@ async def train_model(
         cleanup_start_time = time.time() # Timing start for job.cleanup()
         logger.info("Cleaning up job...")
         job.cleanup()
+        super.cleanup()
+
         cleanup_runtime = time.time() - cleanup_start_time # Calculate cleanup runtime
         logger.info(f"Job cleanup completed in {cleanup_runtime:.2f} seconds.") # Log cleanup runtime
 
@@ -524,33 +526,14 @@ class JobStatus(BaseModel):
     folder_url: Optional[str] = None
     error: Optional[str] = None
 
-async def _run_training_async(request_dict):
-    """Separate async function that can be pickled"""
-    # Reconstruct request from dict
-    request = TrainingRequest(**request_dict)
-    return await train_lora(
-        images=request.images,
-        lora_name=request.lora_name,
-        concept_sentence=request.concept_sentence,
-        steps=request.steps,
-        lr=request.lr,
-        rank=request.rank,
-        model_type=request.model_type,
-        low_vram=True,  # Force low_vram mode
-        sample_prompts=request.sample_prompts,
-        advanced_options=request.advanced_options
-    )
-
-def _run_in_process(request_dict):
-    """Function to run in separate process"""
-    import asyncio
-    return asyncio.run(_run_training_async(request_dict))
-
+# Change back to synchronous function
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
     try:
-        # Clear memory at start
-        clear_gpu_memory()
+        # Clear CUDA cache at the start of each job
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
         # Update job status to processing
         with get_db() as conn:
@@ -560,16 +543,23 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
 
-        # Convert request to dict for pickling
-        request_dict = request.dict()
+        # Run the actual training using asyncio.run
+        import asyncio
+        result = asyncio.run(train_lora(
+            images=request.images,
+            lora_name=request.lora_name,
+            concept_sentence=request.concept_sentence,
+            steps=request.steps,
+            lr=request.lr,
+            rank=request.rank,
+            model_type=request.model_type,
+            low_vram=request.low_vram,
+            sample_prompts=request.sample_prompts,
+            advanced_options=request.advanced_options
+        ))
 
-        # Run in separate process
-        import multiprocessing
-        with multiprocessing.Pool(1) as pool:
-            result = pool.apply(_run_in_process, (request_dict,))
-
-        # Handle result
         if result["status"] == "success":
+            # Update final status
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
@@ -577,6 +567,7 @@ def run_training_job(job_id: str, request: TrainingRequest):
                 )
                 conn.commit()
         else:
+            # Update error status
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
@@ -593,7 +584,10 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
     finally:
-        clear_gpu_memory()
+        # Ensure CUDA cache is cleared after job completion
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
