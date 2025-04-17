@@ -364,7 +364,7 @@ async def train_model(
             },
             "datasets": [{"folder_path": dataset_folder}],
             "save": {
-                "output_dir": f"tmp_models/{slugged_lora_name}",
+                "output_dir": f"output/{slugged_lora_name}",
                 "push_to_hub": False  # Disable Hugging Face push
             }
         })
@@ -441,7 +441,7 @@ async def train_model(
             raise RuntimeError("S3_DOMAIN environment variable is not set")
 
         # After training, verify output directory
-        local_model_dir = f"tmp_models/{slugged_lora_name}"
+        local_model_dir = f"output/{slugged_lora_name}"
         logger.info("Checking for model output directory: %s", local_model_dir)
         
         if not os.path.exists(local_model_dir):
