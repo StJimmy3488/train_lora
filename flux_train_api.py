@@ -367,6 +367,7 @@ async def train_model(
     """Train the model and store exclusively in S3, returning a folder URL."""
     config_path = None
     cleanup_paths = []
+    success = False  # Add flag to track successful completion
     
     try:
         slugged_lora_name = slugify(lora_name)
@@ -564,14 +565,12 @@ async def train_model(
         s3_prefix = f"loras/flux/{slugged_lora_name}"
         logger.info("Uploading trained model to S3: bucket=%s, prefix=%s", bucket_name, s3_prefix)
         
-        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix, cleanup=False)  # Don't cleanup in upload
+        upload_success = upload_directory_to_s3(local_model_dir, bucket_name, s3_prefix, cleanup=False)
         
         if upload_success:
             s3_folder_url = f"{s3_domain}/{s3_prefix}/"
             logger.info("Model folder successfully uploaded to: %s", s3_folder_url)
-            
-            # Only cleanup after successful upload
-            logger.debug("Upload successful, cleaning up temporary files")
+            success = True  # Mark as successful only after upload
             cleanup_paths.extend([local_model_dir, dataset_folder])
             return s3_folder_url
         else:
@@ -579,22 +578,32 @@ async def train_model(
 
     except Exception as e:
         logger.exception("Error during model training or upload")
+        # Log directory contents for debugging
+        for dir_path in [output_dir, local_model_dir]:
+            if os.path.exists(dir_path):
+                logger.error("Contents of %s: %s", dir_path, os.listdir(dir_path))
+            else:
+                logger.error("Directory does not exist: %s", dir_path)
         clear_gpu_memory()
         raise
 
     finally:
-        # Only cleanup paths that were explicitly added after successful upload
-        # for path in cleanup_paths:
-        #     try:
-        #         if os.path.exists(path):
-        #             if os.path.isfile(path):
-        #                 os.remove(path)
-        #                 logger.debug("Removed temporary file: %s", path)
-        #             else:
-        #                 shutil.rmtree(path, ignore_errors=True)
-        #                 logger.debug("Removed temporary directory: %s", path)
-        #     except Exception as e:
-        #         logger.error("Error cleaning up %s: %s", path, e)
+        # Only cleanup if training and upload were successful
+        if success:
+            for path in cleanup_paths:
+                try:
+                    if os.path.exists(path):
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            logger.debug("Removed temporary file: %s", path)
+                        else:
+                            shutil.rmtree(path, ignore_errors=True)
+                            logger.debug("Removed temporary directory: %s", path)
+                except Exception as e:
+                    logger.error("Error cleaning up %s: %s", path, e)
+        else:
+            logger.warning("Training/upload failed, preserving temporary files for debugging")
+            logger.warning("Temporary files remain in: %s and %s", local_model_dir, dataset_folder)
         
         clear_gpu_memory()
 
