@@ -297,79 +297,80 @@ async def train_model(
     with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
         config = yaml.safe_load(f)
 
-    # Update configuration
-    config["config"]["name"] = slugged_lora_name
-    process_block = config["config"]["process"][0]
-    process_block.update({
-        "model": {
-            "low_vram": True,
-            "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
-            "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None
-        },
-        "train": {
-            "skip_first_sample": True,
-            "steps": int(steps),
-            "lr": float(lr),
-            "batch_size": 1,
-            "gradient_accumulation_steps": 4
-        },
-        "network": {
-            "linear": int(rank),
-            "linear_alpha": int(rank)
-        },
-        "datasets": [{"folder_path": dataset_folder}],
-        "save": {
-            "output_dir": f"tmp_models/{slugged_lora_name}",
-            "push_to_hub": False  # Disable Hugging Face push
-        }
-    })
-
-    if concept_sentence:
-        logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
-        process_block["trigger_word"] = concept_sentence
-
-    if sample_prompts:
-        logger.debug("Sample prompts provided. Will enable sampling.")
-        process_block["train"]["disable_sampling"] = False
-        process_block["sample"].update({
-            "sample_every": steps,
-            "sample_steps": 28 if model_type == "dev" else 4,
-            "prompts": sample_prompts
+    try:
+        # Clear memory before starting
+        clear_gpu_memory()
+        
+        # Update configuration to be more memory-efficient
+        config["config"]["process"][0].update({
+            "model": {
+                "low_vram": True,  # Force low VRAM mode
+                "name_or_path": "black-forest-labs/FLUX.1-schnell" if model_type == "schnell" else "black-forest-labs/FLUX.1",
+                "assistant_lora_path": "ostris/FLUX.1-schnell-training-adapter" if model_type == "schnell" else None,
+                "gradient_checkpointing": True,  # Enable gradient checkpointing
+                "enable_xformers_memory_efficient_attention": True,  # Enable memory efficient attention
+                "model_cpu_offload": True,  # Enable CPU offloading
+            },
+            "train": {
+                "skip_first_sample": True,
+                "steps": int(steps),
+                "lr": float(lr),
+                "batch_size": 1,  # Minimum batch size
+                "gradient_accumulation_steps": 4,
+                "mixed_precision": "fp16",  # Use mixed precision training
+                "full_fp16": True,  # Use full fp16 training
+            },
+            "network": {
+                "linear": int(rank),
+                "linear_alpha": int(rank)
+            },
+            "datasets": [{"folder_path": dataset_folder}],
+            "save": {
+                "output_dir": f"tmp_models/{slugged_lora_name}",
+                "push_to_hub": False  # Disable Hugging Face push
+            }
         })
-    else:
-        logger.debug("No sample prompts provided. Disabling sampling.")
-        process_block["train"]["disable_sampling"] = True
 
-    if advanced_options:
-        logger.debug("Merging advanced_options YAML into config.")
-        config["config"]["process"][0] = recursive_update(
-            config["config"]["process"][0],
-            yaml.safe_load(advanced_options)
-        )
+        if concept_sentence:
+            logger.debug("Setting concept_sentence (trigger_word) to '%s'.", concept_sentence)
+            config["config"]["process"][0]["trigger_word"] = concept_sentence
 
-    # Save config
-    config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
-    logger.debug("Saving updated config to: %s", config_path)
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, "w") as f:
-        yaml.dump(config, f)
+        if sample_prompts:
+            logger.debug("Sample prompts provided. Will enable sampling.")
+            config["config"]["process"][0]["train"]["disable_sampling"] = False
+            config["config"]["process"][0]["sample"].update({
+                "sample_every": steps,
+                "sample_steps": 28 if model_type == "dev" else 4,
+                "prompts": sample_prompts
+            })
+        else:
+            logger.debug("No sample prompts provided. Disabling sampling.")
+            config["config"]["process"][0]["train"]["disable_sampling"] = True
 
-    # Clear CUDA cache at the start
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        if advanced_options:
+            logger.debug("Merging advanced_options YAML into config.")
+            config["config"]["process"][0] = recursive_update(
+                config["config"]["process"][0],
+                yaml.safe_load(advanced_options)
+            )
 
-    # Run training
-    logger.info("Retrieving job with config path: %s", config_path)
-    job = get_job(config_path, slugged_lora_name)
+        # Save config
+        config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
+        logger.debug("Saving updated config to: %s", config_path)
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "w") as f:
+            yaml.dump(config, f)
 
-    logger.debug("job object => %s", job)
-    if job is None:
-        raise RuntimeError(f"get_job() returned None for config path: {config_path}. Please check your job definition.")
+        # Run training
+        logger.info("Retrieving job with config path: %s", config_path)
+        job = get_job(config_path, slugged_lora_name)
 
-    s3_folder_url = None # Initialize s3_folder_url outside try block
+        logger.debug("job object => %s", job)
+        if job is None:
+            raise RuntimeError(f"get_job() returned None for config path: {config_path}. Please check your job definition.")
 
-    try: # Added try-except block around job.run() and job.cleanup()
+        s3_folder_url = None # Initialize s3_folder_url outside try block
+
         job_start_time = time.time() # Timing start for job.run()
         logger.info("Running job...")
         job.run()
@@ -381,11 +382,6 @@ async def train_model(
         job.cleanup()
         cleanup_runtime = time.time() - cleanup_start_time # Calculate cleanup runtime
         logger.info(f"Job cleanup completed in {cleanup_runtime:.2f} seconds.") # Log cleanup runtime
-
-        # Ensure cleanup happens even if job.run() fails
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
 
         # Upload to S3
         bucket_name = os.environ.get("S3_BUCKET")
@@ -412,22 +408,11 @@ async def train_model(
             logger.warning("No S3_BUCKET set or local_model_dir does not exist. Skipping upload.")
             raise RuntimeError("S3 bucket not configured or model directory missing, cannot complete training.") # Raise error as S3 URL is essential
 
-    except Exception as e_train_job: # Catch exceptions from job.run(), job.cleanup(), or S3 upload
-        logger.error(f"Error during training job execution in train_model: {e_train_job}", exc_info=True)
-        raise RuntimeError(f"Training job failed: {e_train_job}") from e_train_job # Re-raise to be caught by train_lora's except
-
-    finally: # Cleanup always, regardless of training success or failure, and *before* returning
-        # Final cleanup
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-        
-        # Existing cleanup code
-        logger.debug("Removing dataset folder: %s", dataset_folder)
-        shutil.rmtree(dataset_folder, ignore_errors=True)
-        logger.debug("Removing config file: %s", config_path)
-        os.remove(config_path)
-
+    except Exception as e_train_job:
+        clear_gpu_memory()  # Clear memory on error
+        raise
+    finally:
+        clear_gpu_memory()  # Always clear memory when done
 
     if not s3_folder_url: # Check again after the try-except-finally block, in case S3 upload failed inside try
         msg = "Failed to obtain S3 folder URL after training, possibly due to upload failure or S3 configuration issues."
@@ -499,15 +484,14 @@ async def train_lora(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.8)
+        torch.cuda.set_per_process_memory_fraction(0.7)  # Reduce to 70% to leave more headroom
+        torch.cuda.empty_cache()
     init_db()
     yield
     # Shutdown
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        gc.collect()
+    clear_gpu_memory()
 
 app = FastAPI(title="FLUX LoRA Trainer API", lifespan=lifespan)
 
@@ -543,10 +527,8 @@ class JobStatus(BaseModel):
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
     try:
-        # Clear CUDA cache at the start of each job
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+        # Clear memory at start
+        clear_gpu_memory()
 
         # Update job status to processing
         with get_db() as conn:
@@ -556,23 +538,29 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
 
-        # Run the actual training using asyncio.run
-        import asyncio
-        result = asyncio.run(train_lora(
-            images=request.images,
-            lora_name=request.lora_name,
-            concept_sentence=request.concept_sentence,
-            steps=request.steps,
-            lr=request.lr,
-            rank=request.rank,
-            model_type=request.model_type,
-            low_vram=request.low_vram,
-            sample_prompts=request.sample_prompts,
-            advanced_options=request.advanced_options
-        ))
+        # Run in a new process to ensure clean memory state
+        import multiprocessing
+        def run_async():
+            import asyncio
+            return asyncio.run(train_lora(
+                images=request.images,
+                lora_name=request.lora_name,
+                concept_sentence=request.concept_sentence,
+                steps=request.steps,
+                lr=request.lr,
+                rank=request.rank,
+                model_type=request.model_type,
+                low_vram=True,  # Force low_vram mode
+                sample_prompts=request.sample_prompts,
+                advanced_options=request.advanced_options
+            ))
 
+        # Run in separate process
+        with multiprocessing.Pool(1) as pool:
+            result = pool.apply(run_async)
+
+        # Handle result
         if result["status"] == "success":
-            # Update final status
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET status = ?, progress = ?, folder_url = ? WHERE job_id = ?",
@@ -580,7 +568,6 @@ def run_training_job(job_id: str, request: TrainingRequest):
                 )
                 conn.commit()
         else:
-            # Update error status
             with get_db() as conn:
                 conn.execute(
                     "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
@@ -597,10 +584,7 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
     finally:
-        # Ensure CUDA cache is cleared after job completion
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        clear_gpu_memory()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
@@ -740,6 +724,19 @@ def device_context(device="cuda"):
         if device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
+
+def clear_gpu_memory():
+    """Aggressively clear GPU memory"""
+    if torch.cuda.is_available():
+        # Clear PyTorch's CUDA memory cache
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Optional: wait a moment for memory to be freed
+        time.sleep(1)
 
 if __name__ == "__main__":
     import uvicorn
