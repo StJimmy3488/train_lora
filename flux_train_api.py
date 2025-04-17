@@ -41,9 +41,8 @@ import boto3
 from botocore.config import Config
 import os
 import gc
-import signal
-import psutil
-import nvidia_smi  # Add this import at the top
+import subprocess
+import multiprocessing
 
 def get_s3_client():
     """Create S3-compatible client for Cloudflare R2"""
@@ -213,7 +212,8 @@ def process_images_and_captions(images, concept_sentence=None):
             local_image_paths.append(file_path)
 
         for image_path in local_image_paths:
-            image = Image.open(image_path).convert("RGB")
+            with Image.open(path) as raw:
+                image = raw.convert("RGB")
 
             prompt = "<DETAILED_CAPTION>"
             inputs = processor(
@@ -401,39 +401,23 @@ async def train_model(
             job.run()
             job_runtime = time.time() - job_start_time
             logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
-        except Exception as e:
-            logger.exception("Error during job execution")
-            raise
         finally:
             # Ensure cleanup happens even if job.run() fails
             logger.info("Cleaning up job resources...")
-            try:
-                if hasattr(job, 'cleanup') and callable(job.cleanup):
-                    job.cleanup()
-                
-                # Manually clean up any remaining references
-                if hasattr(job, 'model'):
-                    if hasattr(job.model, 'to'):
-                        job.model.to('cpu')
-                    del job.model
-                
-                # Clear all job attributes
-                for attr in dir(job):
-                    if not attr.startswith('__'):
-                        try:
-                            delattr(job, attr)
-                        except:
-                            pass
-                
-                # Force cleanup
-                force_gpu_cleanup()
-                
-                # Clear the job reference
-                del job
-                
-            except Exception as cleanup_error:
-                logger.error(f"Error during job cleanup: {cleanup_error}")
-                force_gpu_cleanup()
+            if hasattr(job, 'cleanup') and callable(job.cleanup):
+                job.cleanup()
+            
+            # Manually clean up any remaining references
+            if hasattr(job, 'model'):
+                if hasattr(job.model, 'to'):
+                    job.model.to('cpu')
+                del job.model
+            
+            # Force garbage collection
+            clear_gpu_memory()
+            
+            # Clear the job reference
+            del job
 
         # Check S3 configuration early
         bucket_name = os.environ.get("S3_BUCKET")
@@ -477,7 +461,7 @@ async def train_model(
 
     except Exception as e:
         logger.exception("Error during model training or upload")
-        force_gpu_cleanup()
+        clear_gpu_memory()
         raise
 
     finally:
@@ -485,12 +469,14 @@ async def train_model(
         try:
             if os.path.exists(config_path):
                 os.remove(config_path)
+                logger.debug("Removed config file: %s", config_path)
             if os.path.exists(dataset_folder):
                 shutil.rmtree(dataset_folder, ignore_errors=True)
+                logger.debug("Removed dataset folder: %s", dataset_folder)
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            logger.error("Error during cleanup: %s", e)
         
-        force_gpu_cleanup()
+        clear_gpu_memory()
 
 
 def recursive_update(d, u):
@@ -552,108 +538,17 @@ async def train_lora(
         logger.debug("Final cleanup (check if tmp dirs are removed by train_model's finally).")
 
 
-def force_gpu_cleanup():
-    """Force cleanup of GPU memory and processes"""
-    try:
-        # Kill any remaining CUDA processes
-        current_process = psutil.Process()
-        for child in current_process.children(recursive=True):
-            try:
-                child.kill()
-            except psutil.NoSuchProcess:
-                pass
-
-        # Reset NVIDIA GPU state
-        if torch.cuda.is_available():
-            try:
-                nvidia_smi.nvmlInit()
-                deviceCount = nvidia_smi.nvmlDeviceGetCount()
-                for i in range(deviceCount):
-                    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
-                    nvidia_smi.nvmlDeviceSetComputeMode(handle, 0)  # Set to DEFAULT
-                nvidia_smi.nvmlShutdown()
-            except Exception as e:
-                logger.error(f"Error resetting NVIDIA GPU state: {e}")
-
-        # Clear PyTorch CUDA memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            for i in range(torch.cuda.device_count()):
-                torch.cuda.set_device(i)
-                torch.cuda.empty_cache()
-                if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
-                    torch.cuda.reset_accumulated_memory_stats()
-
-        # Force garbage collection
-        for _ in range(5):
-            gc.collect()
-
-        # Optional: wait for memory to be freed
-        time.sleep(2)
-
-    except Exception as e:
-        logger.error(f"Error during force cleanup: {e}")
-
-def clear_gpu_memory():
-    """Aggressively clear GPU memory"""
-    if torch.cuda.is_available():
-        try:
-            # Move all tensors to CPU
-            for obj in gc.get_objects():
-                if torch.is_tensor(obj):
-                    if obj.is_cuda:
-                        obj.cpu()
-                elif hasattr(obj, 'cuda') and callable(obj.cuda):
-                    obj.to('cpu')
-
-            # Clear CUDA memory
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            
-            # Force garbage collection multiple times
-            for _ in range(3):
-                gc.collect()
-            
-            # Log memory stats
-            logger.debug(
-                "GPU Memory: Allocated: %.1f GB, Reserved: %.1f GB, Max: %.1f GB",
-                torch.cuda.memory_allocated() / 1e9,
-                torch.cuda.memory_reserved() / 1e9,
-                torch.cuda.max_memory_allocated() / 1e9
-            )
-
-            # If memory usage is still high, force cleanup
-            if torch.cuda.memory_allocated() > 1e9:  # If more than 1GB is still allocated
-                logger.warning("High memory usage detected after cleanup, forcing aggressive cleanup")
-                force_gpu_cleanup()
-                
-        except Exception as e:
-            logger.error(f"Error during memory cleanup: {e}")
-            force_gpu_cleanup()
-
-def setup_signal_handlers():
-    """Setup signal handlers for graceful shutdown"""
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, cleaning up...")
-        force_gpu_cleanup()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    setup_signal_handlers()
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.7)
-        clear_gpu_memory()
+        torch.cuda.set_per_process_memory_fraction(0.7)  # Reduce to 70% to leave more headroom
+        torch.cuda.empty_cache()
     init_db()
     yield
     # Shutdown
-    force_gpu_cleanup()
+    clear_gpu_memory()
 
 app = FastAPI(title="FLUX LoRA Trainer API", lifespan=lifespan)
 
@@ -686,13 +581,79 @@ class JobStatus(BaseModel):
     folder_url: Optional[str] = None
     error: Optional[str] = None
 
-# Change back to synchronous function
+def get_subprocess_env():
+    """Get environment variables for subprocess"""
+    env = os.environ.copy()
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+    return env
+
+def run_training_in_subprocess(request_dict, job_id):
+    """Run the training in a separate Python process"""
+    cmd = [
+        sys.executable,  # Current Python interpreter
+        "-c",
+        f"""
+import sys, os, json, torch, gc
+sys.path.extend([os.getcwd(), "ai-toolkit"])
+from flux_train_api import train_lora
+
+# Setup GPU environment
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    gc.collect()
+
+try:
+    request_dict = json.loads('{json.dumps(request_dict)}')
+    import asyncio
+    result = asyncio.run(train_lora(**request_dict))
+finally:
+    # Cleanup GPU memory before exit
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+print(json.dumps(result))
+"""
+    ]
+    
+    try:
+        # Run the subprocess with environment variables and timeout
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=get_subprocess_env()
+        )
+        
+        # Wait for the process to complete with a timeout
+        stdout, stderr = process.communicate(timeout=7200)  # 2 hour timeout
+        
+        if process.returncode != 0:
+            logger.error("Training subprocess failed: %s", stderr.decode())
+            return {"status": "error", "message": stderr.decode()}
+        
+        # Parse the result
+        return json.loads(stdout.decode())
+        
+    except subprocess.TimeoutExpired:
+        logger.error("Training subprocess timed out")
+        process.kill()
+        return {"status": "error", "message": "Training timed out after 2 hours"}
+    except Exception as e:
+        logger.exception("Error running training subprocess")
+        if process.poll() is None:
+            process.kill()
+        return {"status": "error", "message": str(e)}
+    finally:
+        # Ensure process is terminated
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
 def run_training_job(job_id: str, request: TrainingRequest):
     """Background task to run the training job"""
     try:
-        # Clear memory at start
-        force_gpu_cleanup()
-
         # Update job status to processing
         with get_db() as conn:
             conn.execute(
@@ -701,20 +662,11 @@ def run_training_job(job_id: str, request: TrainingRequest):
             )
             conn.commit()
 
-        # Run the actual training using asyncio.run
-        import asyncio
-        result = asyncio.run(train_lora(
-            images=request.images,
-            lora_name=request.lora_name,
-            concept_sentence=request.concept_sentence,
-            steps=request.steps,
-            lr=request.lr,
-            rank=request.rank,
-            model_type=request.model_type,
-            low_vram=request.low_vram,
-            sample_prompts=request.sample_prompts,
-            advanced_options=request.advanced_options
-        ))
+        # Convert request to dict for subprocess
+        request_dict = request.dict()
+        
+        # Run training in subprocess
+        result = run_training_in_subprocess(request_dict, job_id)
 
         if result["status"] == "success":
             # Update final status
@@ -741,9 +693,6 @@ def run_training_job(job_id: str, request: TrainingRequest):
                 ("failed", str(e), job_id)
             )
             conn.commit()
-    finally:
-        # Force cleanup after job completion or failure
-        force_gpu_cleanup()
 
 @app.post("/train", response_model=TrainingResponse)
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
@@ -883,6 +832,28 @@ def device_context(device="cuda"):
         if device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
+
+def clear_gpu_memory():
+    """Aggressively clear GPU memory"""
+    if torch.cuda.is_available():
+        # Clear PyTorch's CUDA memory cache
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Force garbage collection multiple times
+        for _ in range(3):
+            gc.collect()
+        
+        # Optional: wait a moment for memory to be freed
+        time.sleep(1)
+        
+        # Log memory stats
+        logger.debug(
+            "GPU Memory: Allocated: %.1f GB, Reserved: %.1f GB, Max: %.1f GB",
+            torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9,
+            torch.cuda.max_memory_allocated() / 1e9
+        )
 
 if __name__ == "__main__":
     import uvicorn
