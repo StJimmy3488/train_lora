@@ -23,6 +23,7 @@ from slugify import slugify
 
 from transformers import AutoProcessor, AutoModelForCausalLM
 from botocore.config import Config
+from s3_utils import upload_directory_to_s3
 
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, "ai-toolkit")
@@ -73,53 +74,88 @@ def get_s3_client():
     )
 
 
-def upload_directory_to_s3(local_dir, bucket_name, s3_prefix):
-    """Uploads a directory to S3 while maintaining folder structure"""
-    logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
-                local_dir, bucket_name, s3_prefix)
+# def upload_directory_to_s3(local_dir, bucket_name, s3_prefix, cleanup=True):
+#     """Uploads a directory to S3 while maintaining folder structure"""
+#     logger.info("Starting S3 upload from '%s' to bucket '%s' with prefix '%s'",
+#                 local_dir, bucket_name, s3_prefix)
     
-    if not os.path.exists(local_dir):
-        logger.error("Local directory '%s' does not exist", local_dir)
-        return False
+#     if not os.path.exists(local_dir):
+#         logger.error("Local directory '%s' does not exist", local_dir)
+#         return False
         
-    try:
-        s3 = get_s3_client()
+#     try:
+#         # Verify directory has files before attempting upload
+#         total_files = 0
+#         file_list = []
+#         for root, _, files in os.walk(local_dir):
+#             for file in files:
+#                 full_path = os.path.join(root, file)
+#                 if os.path.getsize(full_path) > 0:  # Only count non-empty files
+#                     total_files += 1
+#                     file_list.append(full_path)
+#                     logger.debug("Found file: %s (%.2f MB)", 
+#                                full_path, os.path.getsize(full_path)/1024/1024)
         
-        # Count files first
-        total_files = sum([len(files) for _, _, files in os.walk(local_dir)])
-        logger.info("Found %d files to upload", total_files)
+#         if total_files == 0:
+#             logger.error("No valid files found in directory '%s' to upload", local_dir)
+#             return False
+            
+#         logger.info("Found %d files to upload", total_files)
         
-        uploaded_files = 0
-        for root, _, files in os.walk(local_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                relative_path = os.path.relpath(local_path, local_dir)
-                s3_key = f"{s3_prefix}/{relative_path}"
+#         s3 = get_s3_client()
+#         uploaded_files = 0
+        
+#         for local_path in file_list:
+#             try:
+#                 relative_path = os.path.relpath(local_path, local_dir)
+#                 s3_key = f"{s3_prefix}/{relative_path}"
                 
-                try:
-                    logger.debug("Uploading file %d/%d: '%s' to '%s'",
-                               uploaded_files + 1, total_files, local_path, s3_key)
-                    s3.upload_file(local_path, bucket_name, s3_key)
-                    uploaded_files += 1
-                except Exception as e:
-                    logger.error("Failed to upload '%s': %s", local_path, e)
-                    return False
+#                 # Verify file still exists and is readable
+#                 if not os.path.exists(local_path):
+#                     logger.error("File disappeared during upload: %s", local_path)
+#                     continue
+                    
+#                 if not os.access(local_path, os.R_OK):
+#                     logger.error("File not readable: %s", local_path)
+#                     continue
                 
-        logger.info("Successfully uploaded %d/%d files", uploaded_files, total_files)
-        return uploaded_files > 0  # Return True only if we uploaded at least one file
+#                 logger.debug("Uploading file %d/%d: '%s' to '%s'",
+#                            uploaded_files + 1, total_files, local_path, s3_key)
+#                 s3.upload_file(local_path, bucket_name, s3_key)
+#                 uploaded_files += 1
+                
+#                 # Verify upload
+#                 try:
+#                     s3.head_object(Bucket=bucket_name, Key=s3_key)
+#                     logger.debug("Verified upload of: %s", s3_key)
+#                 except Exception as e:
+#                     logger.error("Failed to verify upload of '%s': %s", s3_key, e)
+#                     return False
+                    
+#             except Exception as e:
+#                 logger.error("Failed to upload '%s': %s", local_path, e)
+#                 return False
+                
+#         logger.info("Successfully uploaded %d/%d files", uploaded_files, total_files)
+#         success = uploaded_files == total_files
         
-    except NoCredentialsError:
-        logger.error("AWS credentials not available")
-        return False
-    except Exception as e:
-        logger.exception("Error during S3 upload: %s", e)
-        return False
-    finally:
-        try:
-            logger.debug("Cleaning up local directory '%s'", local_dir)
-            shutil.rmtree(local_dir, ignore_errors=True)
-        except Exception as e:
-            logger.error("Error cleaning up local directory: %s", e)
+#         if cleanup and success:
+#             try:
+#                 logger.debug("Upload successful, cleaning up local directory '%s'", local_dir)
+#                 shutil.rmtree(local_dir, ignore_errors=True)
+#             except Exception as e:
+#                 logger.error("Error cleaning up local directory: %s", e)
+#         elif not success:
+#             logger.warning("Upload incomplete, keeping local directory: %s", local_dir)
+            
+#         return success
+        
+#     except NoCredentialsError:
+#         logger.error("AWS credentials not available")
+#         return False
+#     except Exception as e:
+#         logger.exception("Error during S3 upload: %s", e)
+#         return False
 
 
 async def resolve_image_path(image_item):
@@ -441,7 +477,7 @@ async def train_model(
             raise RuntimeError("S3_DOMAIN environment variable is not set")
 
         # After training, verify output directory
-        local_model_dir = f"output/{slugged_lora_name}"
+        local_model_dir = f"tmp_models/{slugged_lora_name}"
         logger.info("Checking for model output directory: %s", local_model_dir)
         
         if not os.path.exists(local_model_dir):
@@ -607,8 +643,6 @@ def run_training_in_subprocess(request_dict, job_id):
         
         logger.debug("Subprocess environment configuration:")
         env = get_subprocess_env()
-        for key in ['PYTORCH_CUDA_ALLOC_CONF', 'CUDA_VISIBLE_DEVICES']:
-            logger.debug(f"  {key}: {env.get(key, 'not set')}")
         
         logger.info("Launching subprocess with train_subprocess.py")
         process = subprocess.Popen(
@@ -618,33 +652,69 @@ def run_training_in_subprocess(request_dict, job_id):
             stderr=subprocess.PIPE,
             env=env,
             text=True,
-            bufsize=1  # Line buffered
+            bufsize=1
         )
         
-        # Use a queue to capture the final result
         import queue
         result_queue = queue.Queue()
         
-        def log_output(pipe, level, is_stdout=False):
+        def parse_log_level(line):
+            """Parse log level from line and strip timestamp"""
+            line = line.strip()
+            if not line:
+                return None, None
+                
+            # Try to extract log level from standard format
+            level_markers = {
+                '[DEBUG]': logging.DEBUG,
+                '[INFO]': logging.INFO,
+                '[WARNING]': logging.WARNING,
+                '[ERROR]': logging.ERROR,
+                '[CRITICAL]': logging.CRITICAL
+            }
+            
+            for marker, level in level_markers.items():
+                if marker in line:
+                    # Remove timestamp and level from message
+                    parts = line.split(marker, 1)
+                    if len(parts) == 2:
+                        return level, parts[1].strip()
+            
+            return None, line
+
+        def log_output(pipe, is_stderr=False):
+            """Parse and log output with appropriate levels"""
             final_output = []
             for line in iter(pipe.readline, ''):
-                if level == logging.INFO:
-                    if line.startswith('{"status":'):
-                        # This is our JSON result
-                        result_queue.put(line.strip())
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Check for JSON result first
+                if line.startswith('{"status":'):
+                    result_queue.put(line)
+                    continue
+                
+                # Parse log level and message
+                level, message = parse_log_level(line)
+                
+                if level is None:
+                    # If no level found, use default levels
+                    if is_stderr and any(err in line.lower() for err in ['error:', 'exception:', 'traceback:']):
+                        level = logging.ERROR
                     else:
-                        logger.info(f"Subprocess: {line.strip()}")
-                        if is_stdout:
-                            final_output.append(line.strip())
-                else:
-                    logger.error(f"Subprocess error: {line.strip()}")
-            if is_stdout and not result_queue.qsize():
-                # If no JSON result was found, store the full output
+                        level = logging.INFO
+                    message = line
+                
+                logger.log(level, "Subprocess: %s", message)
+                if not is_stderr:
+                    final_output.append(line)
+            
+            if not is_stderr and not result_queue.qsize():
                 result_queue.put('\n'.join(final_output))
         
-        import threading
-        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, logging.INFO, True))
-        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, logging.ERROR, False))
+        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, False))
+        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, True))
         stdout_thread.daemon = True
         stderr_thread.daemon = True
         stdout_thread.start()
