@@ -369,6 +369,12 @@ async def train_model(
         slugged_lora_name = slugify(lora_name)
         logger.info("Training LoRA model. Name: %s, Slug: %s", lora_name, slugged_lora_name)
 
+        # Create output directory early
+        output_dir = f"output/{slugged_lora_name}"
+        local_model_dir = f"tmp_models/{slugged_lora_name}"
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(local_model_dir, exist_ok=True)
+        
         # Load default config
         logger.debug("Loading default config file: config/examples/train_lora_flux_24gb.yaml")
         with open("config/examples/train_lora_flux_24gb.yaml", "r") as f:
@@ -377,7 +383,7 @@ async def train_model(
         # Clear memory before starting
         clear_gpu_memory()
         
-        # Update configuration to be more memory-efficient
+        # Update configuration with consistent output path
         config["config"]["process"][0].update({
             "model": {
                 "low_vram": True,  # Force low VRAM mode
@@ -402,8 +408,8 @@ async def train_model(
             },
             "datasets": [{"folder_path": dataset_folder}],
             "save": {
-                "output_dir": f"output/{slugged_lora_name}",
-                "push_to_hub": False  # Disable Hugging Face push
+                "output_dir": output_dir,  # Use the same output_dir consistently
+                "push_to_hub": False
             }
         })
 
@@ -477,6 +483,23 @@ async def train_model(
         s3_domain = os.getenv("S3_DOMAIN")
         if not s3_domain:
             raise RuntimeError("S3_DOMAIN environment variable is not set")
+
+        # After training, move files from output_dir to local_model_dir
+        if os.path.exists(output_dir):
+            logger.info("Moving files from %s to %s", output_dir, local_model_dir)
+            for item in os.listdir(output_dir):
+                src = os.path.join(output_dir, item)
+                dst = os.path.join(local_model_dir, item)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                    logger.debug("Copied %s to %s", src, dst)
+                elif os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    logger.debug("Copied directory %s to %s", src, dst)
+
+        # Verify files were copied
+        if not os.path.exists(local_model_dir) or not os.listdir(local_model_dir):
+            raise RuntimeError(f"No files were copied to {local_model_dir}")
 
         # After training, verify output directory
         local_model_dir = f"tmp_models/{slugged_lora_name}"
