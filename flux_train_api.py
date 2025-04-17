@@ -32,8 +32,12 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-    level=logging.DEBUG, 
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Log to stdout
+        logging.FileHandler('training.log')  # Also log to file
+    ]
 )
 
 
@@ -590,35 +594,68 @@ def get_subprocess_env():
 def run_training_in_subprocess(request_dict, job_id):
     """Run the training in a separate Python process"""
     try:
-        # Convert request dict to JSON
+        logger.info(f"Starting training subprocess for job {job_id}")
         request_json = json.dumps(request_dict)
         
-        # Run the subprocess with environment variables and timeout
+        logger.debug("Subprocess environment configuration:")
+        env = get_subprocess_env()
+        for key in ['PYTORCH_CUDA_ALLOC_CONF', 'CUDA_VISIBLE_DEVICES']:
+            logger.debug(f"  {key}: {env.get(key, 'not set')}")
+        
+        logger.info("Launching subprocess with train_subprocess.py")
         process = subprocess.Popen(
             [sys.executable, "train_subprocess.py"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=get_subprocess_env(),
-            text=True  # Use text mode for easier JSON handling
+            env=env,
+            text=True,
+            bufsize=1  # Line buffered
         )
         
-        # Send request data to subprocess
-        stdout, stderr = process.communicate(input=request_json, timeout=7200)
+        # Create separate threads to continuously read stdout and stderr
+        def log_output(pipe, level):
+            for line in iter(pipe.readline, ''):
+                if level == logging.INFO:
+                    logger.info(f"Subprocess: {line.strip()}")
+                else:
+                    logger.error(f"Subprocess error: {line.strip()}")
         
-        if process.returncode != 0:
-            logger.error("Training subprocess failed: %s", stderr)
-            return {"status": "error", "message": stderr}
+        import threading
+        stdout_thread = threading.Thread(target=log_output, args=(process.stdout, logging.INFO))
+        stderr_thread = threading.Thread(target=log_output, args=(process.stderr, logging.ERROR))
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        logger.info("Sending request data to subprocess")
+        process.stdin.write(request_json + "\n")
+        process.stdin.flush()
+        
+        # Wait for process to complete
+        returncode = process.wait(timeout=7200)
+        stdout_thread.join()
+        stderr_thread.join()
+        
+        if returncode != 0:
+            logger.error(f"Subprocess failed with return code {returncode}")
+            return {"status": "error", "message": "Training process failed"}
+        
+        # Get the final output
+        final_output = process.stdout.read()
+        logger.info("Subprocess completed successfully")
         
         try:
-            # Parse the result
-            return json.loads(stdout)
+            result = json.loads(final_output)
+            logger.info(f"Training result: {result}")
+            return result
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse subprocess output: %s\nOutput was: %s", e, stdout)
+            logger.error(f"Failed to parse subprocess output: {e}\nOutput was: {final_output}")
             return {"status": "error", "message": f"Failed to parse training result: {e}"}
             
     except subprocess.TimeoutExpired:
-        logger.error("Training subprocess timed out")
+        logger.error("Training subprocess timed out after 2 hours")
         process.kill()
         return {"status": "error", "message": "Training timed out after 2 hours"}
     except Exception as e:
@@ -830,6 +867,14 @@ def clear_gpu_memory():
             torch.cuda.memory_reserved() / 1e9,
             torch.cuda.max_memory_allocated() / 1e9
         )
+
+@app.get("/test_logging")
+async def test_logging():
+    logger.debug("This is a debug message")
+    logger.info("This is an info message")
+    logger.warning("This is a warning message")
+    logger.error("This is an error message")
+    return {"message": "Logging test completed"}
 
 if __name__ == "__main__":
     import uvicorn
