@@ -365,8 +365,8 @@ async def train_model(
     advanced_options=None
 ):
     """Train the model and store exclusively in S3, returning a folder URL."""
-    config_path = None  # Define outside try block so finally can access it
-    cleanup_paths = []  # Track paths that need cleanup
+    config_path = None
+    cleanup_paths = []
     
     try:
         slugged_lora_name = slugify(lora_name)
@@ -377,6 +377,13 @@ async def train_model(
         local_model_dir = f"tmp_models/{slugged_lora_name}"
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(local_model_dir, exist_ok=True)
+
+        # Log initial directory state
+        logger.info("Initial output directory state:")
+        if os.path.exists(output_dir):
+            logger.info("Contents of %s: %s", output_dir, os.listdir(output_dir))
+        else:
+            logger.info("Output directory does not exist yet")
 
         # Save config
         config_path = f"tmp_configs/{uuid.uuid4()}-{slugged_lora_name}.yaml"
@@ -453,33 +460,96 @@ async def train_model(
         logger.info("Retrieving job with config path: %s", config_path)
         job = get_job(config_path, slugged_lora_name)
 
-        logger.debug("job object => %s", job)
         if job is None:
             raise RuntimeError(f"get_job() returned None for config path: {config_path}.")
 
         try:
             job_start_time = time.time()
             logger.info("Running job...")
+            
+            # Start a monitoring thread to check output directory
+            def monitor_output():
+                while True:
+                    time.sleep(30)  # Check every 30 seconds
+                    if os.path.exists(output_dir):
+                        files = os.listdir(output_dir)
+                        logger.info("Current output directory contents: %s", files)
+                    else:
+                        logger.info("Output directory still does not exist")
+
+            monitor_thread = threading.Thread(target=monitor_output, daemon=True)
+            monitor_thread.start()
+
+            # Run the job
             job.run()
             job_runtime = time.time() - job_start_time
             logger.info(f"Job run completed in {job_runtime:.2f} seconds.")
+
+            # Check output directory immediately after job completion
+            logger.info("Checking output directory after job completion:")
+            if os.path.exists(output_dir):
+                files = os.listdir(output_dir)
+                logger.info("Files in output directory: %s", files)
+                for file in files:
+                    full_path = os.path.join(output_dir, file)
+                    if os.path.isfile(full_path):
+                        size = os.path.getsize(full_path)
+                        logger.info("File %s size: %.2f MB", file, size/1024/1024)
+            else:
+                logger.error("Output directory does not exist after job completion")
+                raise RuntimeError("Training job did not create output directory")
+
         finally:
-            # Ensure cleanup happens even if job.run() fails
+            # Cleanup job resources
             logger.info("Cleaning up job resources...")
             if hasattr(job, 'cleanup') and callable(job.cleanup):
                 job.cleanup()
             
-            # Manually clean up any remaining references
             if hasattr(job, 'model'):
                 if hasattr(job.model, 'to'):
                     job.model.to('cpu')
                 del job.model
             
-            # Force garbage collection
             clear_gpu_memory()
-            
-            # Clear the job reference
             del job
+
+        # Wait a moment for any file operations to complete
+        time.sleep(2)
+
+        # After training, check and move files
+        if os.path.exists(output_dir):
+            logger.info("Moving files from %s to %s", output_dir, local_model_dir)
+            output_files = os.listdir(output_dir)
+            if not output_files:
+                logger.error("Output directory exists but is empty after training")
+                raise RuntimeError(f"No files were created in {output_dir} during training")
+
+            for item in output_files:
+                src = os.path.join(output_dir, item)
+                dst = os.path.join(local_model_dir, item)
+                try:
+                    if os.path.isfile(src):
+                        shutil.move(src, dst)
+                        logger.info("Moved file: %s -> %s (%.2f MB)", 
+                                  item, dst, os.path.getsize(dst)/1024/1024)
+                    elif os.path.isdir(src):
+                        shutil.move(src, dst)
+                        logger.info("Moved directory: %s -> %s", item, dst)
+                except Exception as e:
+                    logger.error("Error moving %s to %s: %s", src, dst, e)
+                    raise RuntimeError(f"Failed to move training output: {str(e)}")
+
+        # Verify files exist before upload
+        if not os.path.exists(local_model_dir):
+            logger.error("Model directory does not exist after file move")
+            raise RuntimeError(f"Model directory {local_model_dir} does not exist")
+
+        model_files = os.listdir(local_model_dir)
+        if not model_files:
+            logger.error("Model directory is empty after file move")
+            raise RuntimeError(f"No files found in {local_model_dir} after training")
+
+        logger.info("Files ready for upload: %s", model_files)
 
         # Check S3 configuration early
         bucket_name = os.environ.get("S3_BUCKET")
@@ -489,28 +559,6 @@ async def train_model(
         s3_domain = os.getenv("S3_DOMAIN")
         if not s3_domain:
             raise RuntimeError("S3_DOMAIN environment variable is not set")
-
-        # After training, check and move files
-        if os.path.exists(output_dir):
-            logger.info("Moving files from %s to %s", output_dir, local_model_dir)
-            try:
-                # Move files instead of copying
-                for item in os.listdir(output_dir):
-                    src = os.path.join(output_dir, item)
-                    dst = os.path.join(local_model_dir, item)
-                    if os.path.isfile(src):
-                        shutil.move(src, dst)
-                        logger.debug("Moved file: %s -> %s", src, dst)
-                    elif os.path.isdir(src):
-                        shutil.move(src, dst)
-                        logger.debug("Moved directory: %s -> %s", src, dst)
-            except Exception as e:
-                logger.error("Error moving files: %s", e)
-                raise RuntimeError(f"Failed to move training output: {str(e)}")
-
-        # Verify files exist before upload
-        if not os.path.exists(local_model_dir) or not os.listdir(local_model_dir):
-            raise RuntimeError(f"No files found in {local_model_dir} after training")
 
         # Upload to S3
         s3_prefix = f"loras/flux/{slugged_lora_name}"
