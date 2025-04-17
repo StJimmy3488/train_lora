@@ -319,7 +319,7 @@ async def train_model(
             },
             "datasets": [{"folder_path": dataset_folder}],
             "save": {
-                "output_dir": f"tmp_models/{slugged_lora_name}",
+                "output_dir": f"output/{slugged_lora_name}",
                 "push_to_hub": False  # Disable Hugging Face push
             }
         })
@@ -353,7 +353,8 @@ async def train_model(
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w") as f:
             yaml.dump(config, f)
-
+        save_cfg = config["config"]["process"][0]["save"]
+        logger.debug("Model will be saved to: %s", save_cfg["output_dir"])
         # Run training
         logger.info("Retrieving job with config path: %s", config_path)
         job = get_job(config_path, slugged_lora_name)
@@ -398,7 +399,7 @@ async def train_model(
         # After training, verify output directory
         local_model_dir = f"output/{slugged_lora_name}"
         logger.info("Checking for model output directory: %s", local_model_dir)
-        
+        local_model_dir = save_cfg["output_dir"]
         if not os.path.exists(local_model_dir):
             # Log directory contents to help debug
             output_dir = "output"
